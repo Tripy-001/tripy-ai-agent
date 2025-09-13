@@ -3,8 +3,9 @@ from typing import List, Dict, Optional, Tuple
 import logging
 import time
 from datetime import datetime, timedelta
-from models.request_models import TripPlanRequest, TravelStyle, ActivityLevel
-from models.place_models import PlaceCategory, EnhancedPlace, PlacesSearchResult
+import httpx
+from src.models.request_models import TripPlanRequest, TravelStyle, ActivityLevel
+from src.models.place_models import PlaceCategory, EnhancedPlace, PlacesSearchResult
 
 class GooglePlacesService:
     def __init__(self, api_key: str):
@@ -12,17 +13,22 @@ class GooglePlacesService:
         self.logger = logging.getLogger(__name__)
         self.api_calls_made = 0
         self.rate_limit_delay = 0.1  # 100ms delay between calls
+        self.http_client = httpx.Client(timeout=20.0)
+        self.api_key = api_key
+        # Demo-friendly safeguard: hard cap total Places API calls per trip
+        self.max_calls_per_trip = 20
     
     def fetch_all_places_for_trip(self, request: TripPlanRequest) -> Dict[str, List[Dict]]:
         """Fetch all relevant places for the trip based on user preferences and requirements"""
         
         try:
-            # Get destination coordinates
+            # Reset per-trip counter and get destination coordinates
+            self.api_calls_made = 0
             coordinates = self._geocode_destination(request.destination)
             if not coordinates:
                 raise ValueError(f"Could not find coordinates for {request.destination}")
             
-            self.logger.info(f"Fetching places for {request.destination} at {coordinates}")
+            self.logger.info(f"Fetching places (Places API v1) for {request.destination} at {coordinates}")
             
             places_data = {
                 "restaurants": [],
@@ -56,10 +62,17 @@ class GooglePlacesService:
             
             # Add must-visit places if specified
             if request.must_visit_places:
-                places_data["must_visit"] = self._fetch_specific_places(request.must_visit_places, coordinates)
+                places_data["must_visit"] = self._fetch_specific_places(
+                    destination=request.destination,
+                    place_names=request.must_visit_places,
+                    coordinates=coordinates
+                )
             
             # Add transportation hubs
-            places_data["transportation_hubs"] = self._fetch_transportation_hubs(coordinates)
+            places_data["transportation_hubs"] = self._fetch_transportation_hubs(
+                destination=request.destination,
+                coordinates=coordinates
+            )
             
             self.logger.info(f"Successfully fetched {sum(len(v) for v in places_data.values())} places")
             return places_data
@@ -106,15 +119,14 @@ class GooglePlacesService:
                 search_terms.append(f"{restriction} restaurants")
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="restaurant",
-                radius=5000
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=5000,
+                page_size=10
             )
-            
-            for place in results[:3]:  # Limit results per search
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:  # limit per search
+                place_details = self._transform_place_v1(place)
                 if place_details and self._matches_price_level(place_details, price_levels):
                     restaurants.append(place_details)
         
@@ -142,28 +154,26 @@ class GooglePlacesService:
         for pref_name, score in request.preferences.dict().items():
             if score >= 3 and pref_name in preference_mapping:
                 for search_term in preference_mapping[pref_name]:
-                    results = self._places_nearby_search(
-                        location=coordinates,
-                        keyword=search_term,
-                        type="tourist_attraction",
-                        radius=10000
+                    results = self._places_search_text_v1(
+                        text_query=f"{search_term} in {request.destination}",
+                        coordinates=coordinates,
+                        radius=10000,
+                        page_size=10
                     )
-                    
-                    for place in results[:3]:
-                        place_details = self._get_enhanced_place_details(place['place_id'])
+                    for place in results[:5]:
+                        place_details = self._transform_place_v1(place)
                         if place_details:
                             attractions.append(place_details)
         
         # Also search for general tourist attractions
-        general_results = self._places_nearby_search(
-            location=coordinates,
-            keyword="tourist attractions",
-            type="tourist_attraction",
-            radius=10000
+        general_results = self._places_search_text_v1(
+            text_query=f"tourist attractions in {request.destination}",
+            coordinates=coordinates,
+            radius=10000,
+            page_size=10
         )
-        
         for place in general_results[:5]:
-            place_details = self._get_enhanced_place_details(place['place_id'])
+            place_details = self._transform_place_v1(place)
             if place_details:
                 attractions.append(place_details)
         
@@ -192,15 +202,14 @@ class GooglePlacesService:
             search_terms.extend(['budget hotels', 'cheap accommodation', 'hostels'])
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="lodging",
-                radius=10000
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=10000,
+                page_size=10
             )
-            
-            for place in results[:3]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     accommodations.append(place_details)
         
@@ -214,15 +223,14 @@ class GooglePlacesService:
         search_terms = ['shopping malls', 'markets', 'local markets', 'boutiques', 'souvenir shops']
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="shopping_mall",
-                radius=8000
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=8000,
+                page_size=10
             )
-            
-            for place in results[:3]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     shopping.append(place_details)
         
@@ -235,15 +243,14 @@ class GooglePlacesService:
         search_terms = ['bars', 'nightclubs', 'pubs', 'live music', 'entertainment']
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="bar",
-                radius=5000
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=5000,
+                page_size=10
             )
-            
-            for place in results[:3]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     nightlife.append(place_details)
         
@@ -256,15 +263,14 @@ class GooglePlacesService:
         search_terms = ['museums', 'cultural centers', 'theaters', 'art galleries', 'historical sites']
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="tourist_attraction",
-                radius=8000
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=8000,
+                page_size=10
             )
-            
-            for place in results[:3]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     cultural.append(place_details)
         
@@ -277,134 +283,121 @@ class GooglePlacesService:
         search_terms = ['parks', 'hiking trails', 'nature reserves', 'beaches', 'outdoor activities']
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="tourist_attraction",
-                radius=15000  # Larger radius for outdoor activities
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {request.destination}",
+                coordinates=coordinates,
+                radius=15000,
+                page_size=10
             )
-            
-            for place in results[:3]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:5]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     outdoor.append(place_details)
         
         return self._remove_duplicates(outdoor)[:15]
     
-    def _fetch_specific_places(self, place_names: List[str], coordinates: Tuple[float, float]) -> List[Dict]:
-        """Fetch specific places mentioned by user"""
+    def _fetch_specific_places(self, destination: str, place_names: List[str], coordinates: Tuple[float, float]) -> List[Dict]:
+        """Fetch specific places mentioned by user using Places API v1."""
         places = []
         
         for place_name in place_names:
-            results = self._places_text_search(place_name, coordinates)
-            for place in results[:2]:  # Limit to 2 results per place
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            results = self._places_search_text_v1(
+                text_query=f"{place_name} in {destination}",
+                coordinates=coordinates,
+                radius=20000,
+                page_size=10
+            )
+            for place in results[:3]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     places.append(place_details)
         
         return self._remove_duplicates(places)
     
-    def _fetch_transportation_hubs(self, coordinates: Tuple[float, float]) -> List[Dict]:
-        """Fetch transportation hubs"""
+    def _fetch_transportation_hubs(self, destination: str, coordinates: Tuple[float, float]) -> List[Dict]:
+        """Fetch transportation hubs using Places API v1."""
         transport = []
         
         search_terms = ['airport', 'train station', 'bus station', 'metro station']
         
         for search_term in search_terms:
-            results = self._places_nearby_search(
-                location=coordinates,
-                keyword=search_term,
-                type="transit_station",
-                radius=20000  # Larger radius for transport hubs
+            results = self._places_search_text_v1(
+                text_query=f"{search_term} in {destination}",
+                coordinates=coordinates,
+                radius=20000,
+                page_size=10
             )
-            
-            for place in results[:2]:
-                place_details = self._get_enhanced_place_details(place['place_id'])
+            for place in results[:3]:
+                place_details = self._transform_place_v1(place)
                 if place_details:
                     transport.append(place_details)
         
         return self._remove_duplicates(transport)[:10]
     
-    def _places_nearby_search(self, location: Tuple[float, float], keyword: str, 
-                             type: str, radius: int) -> List[Dict]:
-        """Perform nearby search with rate limiting"""
+    def _places_search_text_v1(self, text_query: str, coordinates: Optional[Tuple[float, float]] = None,
+                               radius: Optional[int] = None, page_size: int = 10) -> List[Dict]:
+        """Use Places API v1 (New) places:searchText endpoint."""
         try:
-            time.sleep(self.rate_limit_delay)  # Rate limiting
-            
-            result = self.client.places_nearby(
-                location=location,
-                keyword=keyword,
-                type=type,
-                radius=radius
-            )
-            
-            self.api_calls_made += 1
-            return result.get('results', [])
-            
-        except Exception as e:
-            self.logger.error(f"Error in nearby search: {str(e)}")
-            return []
-    
-    def _places_text_search(self, query: str, location: Tuple[float, float]) -> List[Dict]:
-        """Perform text search with rate limiting"""
-        try:
+            # Enforce per-trip API call limit
+            if self.api_calls_made >= self.max_calls_per_trip:
+                self.logger.info(
+                    "Places API call skipped: max_calls_per_trip reached",
+                    extra={"max_calls_per_trip": self.max_calls_per_trip}
+                )
+                return []
             time.sleep(self.rate_limit_delay)
-            
-            result = self.client.places(
-                query=query,
-                location=location,
-                radius=50000
-            )
-            
-            self.api_calls_made += 1
-            return result.get('results', [])
-            
-        except Exception as e:
-            self.logger.error(f"Error in text search: {str(e)}")
-            return []
-    
-    def _get_enhanced_place_details(self, place_id: str) -> Optional[Dict]:
-        """Get comprehensive place details with enhanced data structure"""
-        try:
-            time.sleep(self.rate_limit_delay)
-            
-            fields = [
-                'place_id', 'name', 'formatted_address', 'geometry',
-                'rating', 'price_level', 'opening_hours', 'photos',
-                'website', 'international_phone_number', 'types',
-                'business_status', 'user_ratings_total', 'vicinity'
-            ]
-            
-            result = self.client.place(place_id=place_id, fields=fields)
-            self.api_calls_made += 1
-            
-            place_data = result.get('result', {})
-            
-            if not place_data or place_data.get('business_status') != 'OPERATIONAL':
-                return None
-            
-            # Transform to standardized structure
-            return {
-                'place_id': place_data.get('place_id'),
-                'name': place_data.get('name'),
-                'address': place_data.get('formatted_address'),
-                'coordinates': {
-                    'lat': place_data.get('geometry', {}).get('location', {}).get('lat'),
-                    'lng': place_data.get('geometry', {}).get('location', {}).get('lng')
-                },
-                'rating': place_data.get('rating'),
-                'price_level': place_data.get('price_level'),
-                'opening_hours': place_data.get('opening_hours', {}).get('weekday_text', []),
-                'photos': [photo.get('photo_reference') for photo in place_data.get('photos', [])[:3]],
-                'website': place_data.get('website'),
-                'phone': place_data.get('international_phone_number'),
-                'types': place_data.get('types', []),
-                'user_ratings_total': place_data.get('user_ratings_total', 0),
-                'vicinity': place_data.get('vicinity')
+            url = "https://places.googleapis.com/v1/places:searchText"
+            headers = {
+                "X-Goog-Api-Key": self.api_key,
+                "X-Goog-FieldMask": (
+                    "places.id,places.displayName,places.formattedAddress,"
+                    "places.location,places.rating,places.userRatingCount,"
+                    "places.priceLevel,places.types,places.websiteUri,"
+                    "places.internationalPhoneNumber,places.googleMapsUri"
+                )
             }
-            
+            body: Dict[str, any] = {"textQuery": text_query, "pageSize": page_size}
+            if coordinates and radius:
+                body["locationBias"] = {
+                    "circle": {
+                        "center": {"latitude": coordinates[0], "longitude": coordinates[1]},
+                        "radius": radius
+                    }
+                }
+            resp = self.http_client.post(url, headers=headers, json=body)
+            self.api_calls_made += 1
+            if resp.status_code != 200:
+                self.logger.error(f"Places v1 searchText error: {resp.status_code} {resp.text}")
+                return []
+            data = resp.json()
+            return data.get("places", [])
         except Exception as e:
-            self.logger.error(f"Error fetching place details for {place_id}: {str(e)}")
+            self.logger.error(f"Places v1 searchText exception: {str(e)}")
+            return []
+    
+    def _transform_place_v1(self, place: Dict[str, any]) -> Optional[Dict]:
+        """Transform Places API v1 place into our standardized structure."""
+        try:
+            return {
+                'place_id': place.get('id'),
+                'name': (place.get('displayName') or {}).get('text'),
+                'address': place.get('formattedAddress'),
+                'coordinates': {
+                    'lat': (place.get('location') or {}).get('latitude'),
+                    'lng': (place.get('location') or {}).get('longitude')
+                },
+                'rating': place.get('rating'),
+                'price_level': place.get('priceLevel'),
+                'opening_hours': None,
+                'photos': [],
+                'website': place.get('websiteUri'),
+                'phone': place.get('internationalPhoneNumber'),
+                'types': place.get('types', []),
+                'user_ratings_total': place.get('userRatingCount', 0),
+                'vicinity': None
+            }
+        except Exception as e:
+            self.logger.error(f"Transform place v1 error: {str(e)}")
             return None
     
     def _get_price_levels_for_style(self, travel_style: TravelStyle) -> List[int]:

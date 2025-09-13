@@ -49,7 +49,7 @@ class TripPlanRequest(BaseModel):
     
     # Budget
     total_budget: float = Field(..., gt=0)
-    budget_currency: str = Field("USD", regex=r"^[A-Z]{3}$")
+    budget_currency: str = Field("USD", pattern=r"^[A-Z]{3}$")
     budget_breakdown: Optional[BudgetBreakdownModel] = None
     
     # Group Details

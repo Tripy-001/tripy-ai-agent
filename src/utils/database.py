@@ -6,8 +6,8 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
 
-from models.database_models import Base, TripPlan, PlaceCache
-from utils.config import get_settings
+from src.models.database_models import Base, TripPlan, PlaceCache
+from src.utils.config import get_settings
 
 class DatabaseManager:
     def __init__(self):

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends
+import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -7,16 +8,16 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any
 
-from models.request_models import TripPlanRequest
-from models.response_models import TripPlanResponse
-from services.vertex_ai_service import VertexAIService
-from services.google_places_service import GooglePlacesService
-from services.itinerary_generator import ItineraryGeneratorService
-from services.maps_service import MapsService
-from utils.database import DatabaseManager
-from utils.config import get_settings, validate_settings
-from utils.validators import TripRequestValidator
-from utils.formatters import ResponseFormatter
+from src.models.request_models import TripPlanRequest
+from src.models.response_models import TripPlanResponse
+from src.services.vertex_ai_service import VertexAIService
+from src.services.google_places_service import GooglePlacesService
+from src.services.itinerary_generator import ItineraryGeneratorService
+from src.services.maps_service import MapsService
+from src.utils.database import DatabaseManager
+from src.utils.config import get_settings, validate_settings
+from src.utils.validators import TripRequestValidator
+from src.utils.formatters import ResponseFormatter
 
 # Configure logging
 logging.basicConfig(
@@ -68,6 +69,13 @@ async def startup_event():
             logger.error("Invalid settings configuration")
             raise Exception("Invalid settings configuration")
         
+        # Ensure GOOGLE_APPLICATION_CREDENTIALS is exported for ADC (Vertex AI)
+        if settings.GOOGLE_APPLICATION_CREDENTIALS:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.GOOGLE_APPLICATION_CREDENTIALS
+            logger.info("ADC path set from settings", extra={"gac_path": settings.GOOGLE_APPLICATION_CREDENTIALS})
+        else:
+            logger.info("No GOOGLE_APPLICATION_CREDENTIALS in settings; relying on gcloud ADC if present")
+
         # Initialize services
         logger.info("Initializing services...")
         
@@ -109,8 +117,7 @@ def get_services():
 
 @app.post("/api/v1/generate-trip", response_model=TripPlanResponse)
 async def generate_trip_plan(
-    request: TripPlanRequest,
-    background_tasks: BackgroundTasks
+    request: TripPlanRequest
 ):
     """
     Generate a comprehensive trip plan based on structured input
@@ -119,10 +126,31 @@ async def generate_trip_plan(
     using Google Vertex AI Gemini Flash model and Google Places API.
     """
     try:
-        logger.info(f"Received trip generation request for {request.destination}")
+        logger.info(
+            "[generate-trip] Request received",
+            extra={
+                "destination": request.destination,
+                "start_date": str(request.start_date),
+                "end_date": str(request.end_date),
+                "budget": request.total_budget,
+                "currency": request.budget_currency,
+                "group_size": request.group_size,
+                "style": str(request.primary_travel_style),
+                "activity": str(request.activity_level)
+            }
+        )
         
         # Validate the request
         validation_result = TripRequestValidator.validate_complete_request(request)
+        logger.debug(
+            "[generate-trip] Validation completed",
+            extra={
+                "valid": validation_result.get("valid"),
+                "errors_count": len(validation_result.get("errors", [])),
+                "warnings_count": len(validation_result.get("warnings", []))
+            }
+        )
+        
         if not validation_result['valid']:
             raise HTTPException(
                 status_code=400, 
@@ -133,6 +161,23 @@ async def generate_trip_plan(
                 }
             )
         
+        # Debug: pre-check Google Maps key and geocoding
+        try:
+            settings = get_settings()
+            maps_key = settings.GOOGLE_MAPS_API_KEY
+            masked = f"{maps_key[:4]}...{maps_key[-4:]}" if maps_key and len(maps_key) > 8 else (maps_key or "<missing>")
+            logger.info("[generate-trip] Maps API key (masked)", extra={"maps_key": masked})
+            logger.info("[generate-trip] Geocoding destination pre-check", extra={"destination": request.destination})
+            _coords = places_service._geocode_destination(request.destination)
+            logger.info("[generate-trip] Geocoding result", extra={"coords": _coords if _coords else "<none>"})
+            if not _coords:
+                raise HTTPException(status_code=502, detail="Geocoding failed: Could not resolve destination coordinates. Check GOOGLE_MAPS_API_KEY and quota.")
+        except HTTPException:
+            raise
+        except Exception as geo_e:
+            logger.exception("[generate-trip] Geocoding pre-check error")
+            raise HTTPException(status_code=502, detail=f"Geocoding pre-check error: {str(geo_e)}")
+
         # Generate unique trip ID
         trip_id = str(uuid.uuid4())
         logger.info(f"Generated trip ID: {trip_id}")
@@ -142,15 +187,19 @@ async def generate_trip_plan(
             logger.warning(f"Request warnings: {validation_result['warnings']}")
         
         # Generate trip plan
+        logger.info("[generate-trip] Starting itinerary generation", extra={"trip_id": trip_id})
         trip_response = await itinerary_generator.generate_comprehensive_plan(request, trip_id)
-        
-        # Save to database in background
-        background_tasks.add_task(
-            db_manager.save_trip_plan,
-            trip_id,
-            request.dict(),
-            trip_response.dict()
+        logger.info(
+            "[generate-trip] Itinerary generation completed",
+            extra={
+                "trip_id": trip_id,
+                "days": getattr(trip_response, "trip_duration_days", None),
+                "itineraries_count": len(getattr(trip_response, "daily_itineraries", []) or []),
+                "accommodation_primary": getattr(getattr(trip_response, "accommodations", None), "primary_recommendation", None).name if getattr(trip_response, "accommodations", None) else None
+            }
         )
+        
+        # Do not persist to database for this endpoint per requirement
         
         logger.info(f"Successfully generated trip plan {trip_id}")
         return trip_response
@@ -186,8 +235,7 @@ async def get_trip_plan(trip_id: str):
 @app.put("/api/v1/trip/{trip_id}/regenerate", response_model=TripPlanResponse)
 async def regenerate_trip_plan(
     trip_id: str, 
-    request: TripPlanRequest,
-    background_tasks: BackgroundTasks
+    request: TripPlanRequest
 ):
     """Regenerate trip plan with updated parameters"""
     try:
@@ -212,13 +260,7 @@ async def regenerate_trip_plan(
         # Generate new plan
         updated_trip = await itinerary_generator.generate_comprehensive_plan(request, trip_id)
         
-        # Update in database
-        background_tasks.add_task(
-            db_manager.update_trip_plan,
-            trip_id,
-            request.dict(),
-            updated_trip.dict()
-        )
+        # No background updates; respond directly
         
         logger.info(f"Successfully regenerated trip plan {trip_id}")
         return updated_trip
@@ -252,8 +294,9 @@ async def validate_trip_request(request: TripPlanRequest):
     """Validate trip request without generating a plan"""
     try:
         validation_result = TripRequestValidator.validate_complete_request(request)
+        print("🚀 ~ validation_result:", validation_result)
         suggestions = TripRequestValidator.suggest_improvements(request)
-        
+        print("🚀 ~ suggestions:", suggestions)
         return {
             "valid": validation_result['valid'],
             "errors": validation_result['errors'],
@@ -273,42 +316,35 @@ async def search_places(
     category: str = None,
     radius: int = 5000
 ):
-    """Search places by query and location"""
+    """Search places by query and location (Places API v1)."""
     try:
         logger.info(f"Searching places: {query} in {location}")
-        
-        # Get coordinates for the location
+
         coordinates = places_service._geocode_destination(location)
         if not coordinates:
-            raise HTTPException(status_code=400, detail=f"Could not find coordinates for {location}")
-        
-        # Search for places
-        if category:
-            # Category-specific search
-            results = places_service._places_nearby_search(
-                location=coordinates,
-                keyword=query,
-                type=category,
-                radius=radius
-            )
-        else:
-            # General text search
-            results = places_service._places_text_search(query, coordinates)
-        
-        # Get enhanced details for each place
+            logger.warning("Geocode failed, proceeding without location bias", extra={"location": location})
+
+        text_query = f"{query} in {location}" if not category else f"{query} {category} in {location}"
+        results = places_service._places_search_text_v1(
+            text_query=text_query,
+            coordinates=coordinates,
+            radius=radius,
+            page_size=10
+        )
+
         places = []
-        for place in results[:10]:  # Limit to 10 results
-            place_details = places_service._get_enhanced_place_details(place['place_id'])
-            if place_details:
-                places.append(place_details)
-        
+        for place in results[:10]:
+            transformed = places_service._transform_place_v1(place)
+            if transformed:
+                places.append(transformed)
+
         return {
             "query": query,
             "location": location,
             "places": places,
             "total_results": len(places)
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:

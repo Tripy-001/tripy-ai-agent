@@ -71,7 +71,7 @@ services:
       - trip-planner-api
     restart: unless-stopped
 
-  # Monitoring with Prometheus (optional)
+  # Monitoring with Prometheus (optional - only if PROMETHEUS_ENABLED=true)
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -87,8 +87,10 @@ services:
       - '--storage.tsdb.retention.time=200h'
       - '--web.enable-lifecycle'
     restart: unless-stopped
+    profiles:
+      - monitoring
 
-  # Grafana for visualization (optional)
+  # Grafana for visualization (optional - only if PROMETHEUS_ENABLED=true)
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -100,6 +102,8 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+    profiles:
+      - monitoring
 
 volumes:
   postgres_data:

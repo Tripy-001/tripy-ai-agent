@@ -1,22 +1,20 @@
 import re
 from typing import List, Dict, Any, Optional
 from datetime import date, datetime, timedelta
-from models.request_models import TripPlanRequest
+from src.models.request_models import TripPlanRequest
 
 class TripRequestValidator:
     """Validator for trip planning requests"""
     
     @staticmethod
     def validate_destination(destination: str) -> bool:
-        """Validate destination string"""
+        """Validate destination string (allow common punctuation like commas)."""
         if not destination or len(destination.strip()) < 2:
             return False
-        
-        # Check for valid characters (letters, spaces, hyphens, apostrophes)
-        if not re.match(r"^[a-zA-Z\s\-']+$", destination.strip()):
-            return False
-        
-        return True
+        # Allow letters, numbers, spaces, and common punctuation seen in place names
+        # e.g., "Paris, France", "St. John's", "São Paulo", "Queens (NY)", "L'Île-d'Orléans"
+        pattern = r"^[A-Za-z0-9\s\-\'\.,&()/]+$"
+        return re.match(pattern, destination.strip()) is not None
     
     @staticmethod
     def validate_dates(start_date: date, end_date: date) -> Dict[str, Any]:

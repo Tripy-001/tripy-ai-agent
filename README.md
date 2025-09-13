@@ -69,17 +69,27 @@ trip-planner-agent/
 
 3. **Set up environment variables**
    ```bash
+   # Option 1: Use minimal setup (recommended for quick start)
+   cp .env.minimal .env
+   
+   # Option 2: Use full configuration
    cp .env.example .env
-   # Edit .env with your API keys and configuration
+   
+   # Edit .env with your API keys
+   nano .env
    ```
 
-4. **Configure Google Cloud**
-   ```bash
-   # Set up authentication
-   export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
+4. **Configure Google Cloud (Choose one option)**
    
-   # Or use gcloud CLI
+   **Option A: Use gcloud CLI (Recommended)**
+   ```bash
    gcloud auth application-default login
+   gcloud config set project YOUR_PROJECT_ID
+   ```
+   
+   **Option B: Use Service Account Key**
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
    ```
 
 5. **Run the application**
@@ -150,16 +160,46 @@ curl -X POST "http://localhost:8000/api/v1/validate-request" \
 
 ### Environment Variables
 
+#### Required Variables
+| Variable | Description | Where to Get |
+|----------|-------------|--------------|
+| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID | Your Google Cloud Console |
+| `GOOGLE_MAPS_API_KEY` | Google Maps API key | Google Cloud Console > APIs & Services |
+
+#### Optional Variables (have defaults)
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID | Required |
-| `GOOGLE_MAPS_API_KEY` | Google Maps API key | Required |
+| `GOOGLE_CLOUD_LOCATION` | Vertex AI region | `us-central1` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Service account key file | Use `gcloud auth` instead |
 | `DATABASE_URL` | Database connection string | `sqlite:///./trip_planner.db` |
 | `DEBUG_MODE` | Enable debug mode | `false` |
 | `API_PORT` | API server port | `8000` |
 
+### Getting Your API Keys
+
+#### 1. Google Cloud Project ID
+- Go to [Google Cloud Console](https://console.cloud.google.com/)
+- Your Project ID is shown in the project selector at the top
+
+#### 2. Google Maps API Key
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Navigate to **APIs & Services** > **Credentials**
+3. Click **Create Credentials** > **API Key**
+4. Restrict the key to:
+   - **Places API**
+   - **Maps JavaScript API** (for maps)
+   - **Distance Matrix API** (for routing)
+
 ### Google Cloud Setup
 
+#### Option A: Use gcloud CLI (Recommended - No file needed)
+```bash
+# Install gcloud CLI, then:
+gcloud auth application-default login
+gcloud config set project YOUR_PROJECT_ID
+```
+
+#### Option B: Use Service Account Key File
 1. **Enable APIs**
    ```bash
    gcloud services enable aiplatform.googleapis.com

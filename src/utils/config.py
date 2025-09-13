@@ -1,5 +1,5 @@
 import os
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 from typing import Optional
 
 class Settings(BaseSettings):
@@ -37,13 +37,11 @@ class Settings(BaseSettings):
     MAX_BUDGET: float = 100000.0
     
     # Performance Settings
-    MAX_PLACES_PER_CATEGORY: int = 25
+    MAX_PLACES_PER_CATEGORY: int = 10
     MAX_API_CALLS_PER_REQUEST: int = 200
     REQUEST_TIMEOUT_SECONDS: int = 300
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = {"env_file": ".env", "case_sensitive": True}
 
 # Global settings instance
 settings = Settings()
