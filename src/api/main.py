@@ -14,10 +14,12 @@ from src.services.vertex_ai_service import VertexAIService
 from src.services.google_places_service import GooglePlacesService
 from src.services.itinerary_generator import ItineraryGeneratorService
 from src.services.maps_service import MapsService
+from src.services.travel_service import TravelService
 from src.utils.database import DatabaseManager
 from src.utils.config import get_settings, validate_settings
 from src.utils.validators import TripRequestValidator
 from src.utils.formatters import ResponseFormatter
+from src.utils.firestore_manager import FirestoreManager
 
 # Configure logging
 logging.basicConfig(
@@ -53,13 +55,15 @@ app.add_middleware(
 vertex_ai_service: VertexAIService = None
 places_service: GooglePlacesService = None
 maps_service: MapsService = None
+travel_service: TravelService = None
 itinerary_generator: ItineraryGeneratorService = None
 db_manager: DatabaseManager = None
+fs_manager: FirestoreManager = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    global vertex_ai_service, places_service, maps_service, itinerary_generator, db_manager
+    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, db_manager, fs_manager
     
     try:
         settings = get_settings()
@@ -83,12 +87,18 @@ async def startup_event():
             project_id=settings.GOOGLE_CLOUD_PROJECT,
             location=settings.GOOGLE_CLOUD_LOCATION
         )
-        
         places_service = GooglePlacesService(api_key=settings.GOOGLE_MAPS_API_KEY)
         maps_service = MapsService(api_key=settings.GOOGLE_MAPS_API_KEY)
+        travel_service = TravelService()
         
-        itinerary_generator = ItineraryGeneratorService(vertex_ai_service, places_service)
+        itinerary_generator = ItineraryGeneratorService(vertex_ai_service, places_service, travel_service)
         db_manager = DatabaseManager()
+        # Initialize Firestore if enabled
+        if settings.USE_FIRESTORE:
+            try:
+                fs_manager = FirestoreManager()
+            except Exception as fe:
+                logger.warning("Firestore initialization failed; continuing without Firestore", extra={"error": str(fe)})
         
         logger.info("All services initialized successfully")
         
@@ -111,8 +121,10 @@ def get_services():
         'vertex_ai': vertex_ai_service,
         'places': places_service,
         'maps': maps_service,
+        'travel': travel_service,
         'itinerary_generator': itinerary_generator,
-        'db': db_manager
+        'db': db_manager,
+        'fs': fs_manager
     }
 
 @app.post("/api/v1/generate-trip", response_model=TripPlanResponse)
@@ -199,7 +211,16 @@ async def generate_trip_plan(
             }
         )
         
-        # Do not persist to database for this endpoint per requirement
+        # Persist to Firestore if enabled; do not block response on failure
+        try:
+            settings = get_settings()
+            if settings.USE_FIRESTORE and fs_manager is not None:
+                # Serialize Pydantic models to JSON-safe dicts
+                response_data: Dict[str, Any] = trip_response.model_dump(mode="json")
+                request_data: Dict[str, Any] = request.model_dump(mode="json")
+                await fs_manager.save_trip_plan(trip_id, request_data, response_data)
+        except Exception as persist_e:
+            logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
         
         logger.info(f"Successfully generated trip plan {trip_id}")
         return trip_response
@@ -216,6 +237,18 @@ async def get_trip_plan(trip_id: str):
     try:
         logger.info(f"Retrieving trip plan {trip_id}")
         
+        settings = get_settings()
+        trip_plan = None
+        if settings.USE_FIRESTORE and fs_manager is not None:
+            trip_plan = await fs_manager.get_trip_plan(trip_id)
+            if trip_plan:
+                # Support both new structured key 'response' and legacy 'response_data'
+                response_data = trip_plan.get('response') or trip_plan.get('response_data')
+                if not response_data:
+                    raise HTTPException(status_code=404, detail="Trip plan not found")
+                return TripPlanResponse(**response_data)
+
+        # Fallback to SQL DB if Firestore not used or not found
         trip_plan = await db_manager.get_trip_plan(trip_id)
         if not trip_plan:
             raise HTTPException(status_code=404, detail="Trip plan not found")
@@ -252,15 +285,31 @@ async def regenerate_trip_plan(
                 }
             )
         
-        # Check if trip exists
-        existing_trip = await db_manager.get_trip_plan(trip_id)
-        if not existing_trip:
+        # Check if trip exists (Firestore preferred)
+        settings = get_settings()
+        exists = False
+        if settings.USE_FIRESTORE and fs_manager is not None:
+            doc = await fs_manager.get_trip_plan(trip_id)
+            exists = doc is not None
+        else:
+            existing_trip = await db_manager.get_trip_plan(trip_id)
+            exists = existing_trip is not None
+        if not exists:
             raise HTTPException(status_code=404, detail="Trip plan not found")
         
         # Generate new plan
         updated_trip = await itinerary_generator.generate_comprehensive_plan(request, trip_id)
         
-        # No background updates; respond directly
+        # Persist updated plan (non-blocking)
+        try:
+            if settings.USE_FIRESTORE and fs_manager is not None:
+                await fs_manager.update_trip_plan(
+                    trip_id,
+                    request.model_dump(mode="json"),
+                    updated_trip.model_dump(mode="json")
+                )
+        except Exception as persist_e:
+            logger.warning("Trip update persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
         
         logger.info(f"Successfully regenerated trip plan {trip_id}")
         return updated_trip
@@ -277,7 +326,15 @@ async def delete_trip_plan(trip_id: str):
     try:
         logger.info(f"Deleting trip plan {trip_id}")
         
-        success = await db_manager.delete_trip_plan(trip_id)
+        settings = get_settings()
+        success = False
+        if settings.USE_FIRESTORE and fs_manager is not None:
+            success = await fs_manager.delete_trip_plan(trip_id)
+            if not success:
+                # Try SQL fallback
+                success = await db_manager.delete_trip_plan(trip_id)
+        else:
+            success = await db_manager.delete_trip_plan(trip_id)
         if not success:
             raise HTTPException(status_code=404, detail="Trip plan not found")
         

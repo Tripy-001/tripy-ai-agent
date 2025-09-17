@@ -43,6 +43,7 @@ class BudgetBreakdownModel(BaseModel):
 
 class TripPlanRequest(BaseModel):
     # Basic Trip Info
+    origin: str = Field(..., min_length=2, max_length=100)
     destination: str = Field(..., min_length=2, max_length=100)
     start_date: date = Field(...)
     end_date: date = Field(...)

@@ -4,7 +4,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 import httpx
-from src.models.request_models import TripPlanRequest, TravelStyle, ActivityLevel
+from src.models.request_models import TripPlanRequest, TravelStyle, ActivityLevel, AccommodationType
 from src.models.place_models import PlaceCategory, EnhancedPlace, PlacesSearchResult
 
 class GooglePlacesService:
@@ -16,7 +16,7 @@ class GooglePlacesService:
         self.http_client = httpx.Client(timeout=20.0)
         self.api_key = api_key
         # Demo-friendly safeguard: hard cap total Places API calls per trip
-        self.max_calls_per_trip = 20
+        self.max_calls_per_trip = 40
     
     def fetch_all_places_for_trip(self, request: TripPlanRequest) -> Dict[str, List[Dict]]:
         """Fetch all relevant places for the trip based on user preferences and requirements"""
@@ -43,9 +43,10 @@ class GooglePlacesService:
             }
             
             # Fetch places based on preferences and travel style
-            places_data["restaurants"] = self._fetch_restaurants(request, coordinates)
-            places_data["attractions"] = self._fetch_attractions(request, coordinates)
+            # Prioritize accommodations first so we always have solid hotel candidates
             places_data["accommodations"] = self._fetch_accommodations(request, coordinates)
+            places_data["attractions"] = self._fetch_attractions(request, coordinates)
+            places_data["restaurants"] = self._fetch_restaurants(request, coordinates)
             
             # Fetch additional categories based on high preference scores
             if request.preferences.shopping >= 3:
@@ -181,40 +182,111 @@ class GooglePlacesService:
         return unique_attractions[:30]
     
     def _fetch_accommodations(self, request: TripPlanRequest, coordinates: Tuple[float, float]) -> List[Dict]:
-        """Fetch accommodations based on type and travel style"""
-        accommodations = []
-        
-        # Map accommodation type to search terms
+        """Fetch accommodations based on type and travel style with richer diversity."""
+        accommodations: List[Dict] = []
+
+        # Core terms by type
         type_mapping = {
-            'hotel': ['hotels', 'luxury hotels', 'business hotels'],
-            'hostel': ['hostels', 'budget accommodation'],
-            'airbnb': ['vacation rentals', 'apartments', 'home rentals'],
-            'resort': ['resorts', 'beach resorts', 'mountain resorts'],
-            'boutique': ['boutique hotels', 'design hotels', 'unique hotels']
+            'hotel': [
+                'hotels', 'business hotels', 'city center hotels'
+            ],
+            'hostel': [
+                'hostels', 'backpacker hostels', 'youth hostels'
+            ],
+            'airbnb': [
+                'vacation rentals', 'serviced apartments', 'apartments'
+            ],
+            'resort': [
+                'resorts', 'beach resorts', 'spa resorts', 'all inclusive resorts'
+            ],
+            'boutique': [
+                'boutique hotels', 'design hotels', 'heritage hotels'
+            ]
         }
-        
-        search_terms = type_mapping.get(request.accommodation_type, ['hotels'])
-        
-        # Add style-specific terms
-        if request.primary_travel_style == TravelStyle.LUXURY:
-            search_terms.extend(['luxury hotels', '5 star hotels', 'premium accommodation'])
-        elif request.primary_travel_style == TravelStyle.BUDGET:
-            search_terms.extend(['budget hotels', 'cheap accommodation', 'hostels'])
-        
-        for search_term in search_terms:
-            results = self._places_search_text_v1(
-                text_query=f"{search_term} in {request.destination}",
-                coordinates=coordinates,
-                radius=10000,
-                page_size=10
-            )
-            for place in results[:5]:
-                place_details = self._transform_place_v1(place)
-                if place_details:
-                    accommodations.append(place_details)
-        
+
+        search_terms = type_mapping.get(request.accommodation_type.value if hasattr(request.accommodation_type, 'value') else request.accommodation_type, ['hotels'])
+
+        # Style-specific refinements
+        style = request.primary_travel_style
+        if style == TravelStyle.LUXURY:
+            search_terms.extend(['luxury hotels', '5 star hotels', 'premium accommodation', 'executive suites'])
+        elif style == TravelStyle.BUDGET:
+            search_terms.extend(['budget hotels', 'cheap accommodation', 'guest houses', 'capsule hotel'])
+        elif style == TravelStyle.ADVENTURE:
+            search_terms.extend(['eco lodges', 'nature lodges'])
+        elif style == TravelStyle.CULTURAL:
+            search_terms.extend(['heritage stays', 'traditional inns'])
+
+        # Geographical qualifiers to diversify results
+        qualifiers = [
+            '', ' near city center', ' near main station', ' near airport', ' old town', ' downtown'
+        ]
+
+        # Query and collect
+        for term in search_terms:
+            for qual in qualifiers:
+                text = f"{term}{qual} in {request.destination}".strip()
+                results = self._places_search_text_v1(
+                    text_query=text,
+                    coordinates=coordinates,
+                    radius=12000,
+                    page_size=10
+                )
+                for place in results[:5]:
+                    place_details = self._transform_place_v1(place)
+                    if place_details:
+                        # Filter by accommodation type heuristics
+                        if self._accommodation_matches_type(place_details, request.accommodation_type):
+                            accommodations.append(place_details)
+
         unique_accommodations = self._remove_duplicates(accommodations)
-        return unique_accommodations[:15]
+
+        # Filter by price levels that match the travel style (when available)
+        allowed_levels = self._get_price_levels_for_style(request.primary_travel_style)
+        filtered: List[Dict] = []
+        for p in unique_accommodations:
+            if p.get('price_level') is None or p.get('price_level') in allowed_levels:
+                filtered.append(p)
+
+        # Rank by rating, reviews, and alignment with style cost band
+        def _score(place: Dict) -> float:
+            rating = float(place.get('rating') or 0.0)
+            reviews = float(place.get('user_ratings_total') or 0)
+            price = place.get('price_level')
+            # Price alignment: budget prefers 1-2; luxury prefers 3-4; others prefer 2-3
+            target_low, target_high = {
+                TravelStyle.BUDGET: (1, 2),
+                TravelStyle.LUXURY: (3, 4),
+            }.get(request.primary_travel_style, (2, 3))
+            align = 0.0
+            if isinstance(price, int):
+                if target_low <= price <= target_high:
+                    align = 1.0
+                else:
+                    align = 0.5
+            # Weighted score
+            return rating * 100 + min(reviews, 5000) * 0.02 + align * 10
+
+        filtered.sort(key=_score, reverse=True)
+        # Return a concise, high-quality set for the AI
+        return filtered[:20]
+
+    def _accommodation_matches_type(self, place: Dict, accommodation_type) -> bool:
+        """Heuristic match of a place to the requested accommodation type using types and name."""
+        name = (place.get('name') or '').lower()
+        types = [t.lower() for t in (place.get('types') or [])]
+        if accommodation_type == getattr(AccommodationType, 'HOTEL', 'hotel') or str(accommodation_type).lower() == 'hotel':
+            return ('lodging' in types) or ('hotel' in name)
+        if str(accommodation_type).lower() == 'hostel':
+            return ('lodging' in types and 'hostel' in name) or ('hostel' in name)
+        if str(accommodation_type).lower() == 'airbnb':
+            return any(k in name for k in ['apartment', 'serviced apartment', 'vacation rental', 'homestay', 'bnb'])
+        if str(accommodation_type).lower() == 'resort':
+            return ('lodging' in types) and ('resort' in name)
+        if str(accommodation_type).lower() == 'boutique':
+            return ('lodging' in types and ('boutique' in name or 'heritage' in name or 'design' in name)) or ('boutique' in name)
+        # Fallback: accept lodging
+        return 'lodging' in types
     
     def _fetch_shopping_venues(self, request: TripPlanRequest, coordinates: Tuple[float, float]) -> List[Dict]:
         """Fetch shopping venues"""

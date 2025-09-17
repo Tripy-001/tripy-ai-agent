@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     GOOGLE_CLOUD_LOCATION: str = "us-central1"
     GOOGLE_MAPS_API_KEY: str = "your-google-maps-key"
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
+    FIRESTORE_PROJECT_ID: Optional[str] = None
+    FIRESTORE_CREDENTIALS: Optional[str] = None  # path to Firestore service account json
+    FIRESTORE_DATABASE_ID: Optional[str] = None  # defaults to '(default)'
+    USE_FIRESTORE: bool = True
+    FIRESTORE_TRIPS_COLLECTION: str = "trips"
     
     # Database Configuration
     DATABASE_URL: str = "sqlite:///./trip_planner.db"
@@ -66,5 +71,9 @@ def validate_settings() -> bool:
         print(f"Missing or invalid settings: {', '.join(missing_settings)}")
         print("Please configure these settings in your .env file or environment variables")
         return False
+    
+    # If FIRESTORE_PROJECT_ID not set, fallback to GOOGLE_CLOUD_PROJECT (but allow split-projects)
+    if not settings.FIRESTORE_PROJECT_ID:
+        settings.FIRESTORE_PROJECT_ID = settings.GOOGLE_CLOUD_PROJECT
     
     return True

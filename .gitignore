@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 
 config
+gcp-config.json
+firebase-config.json
 
 # C extensions
 *.so

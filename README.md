@@ -174,6 +174,9 @@ curl -X POST "http://localhost:8000/api/v1/validate-request" \
 | `DATABASE_URL` | Database connection string | `sqlite:///./trip_planner.db` |
 | `DEBUG_MODE` | Enable debug mode | `false` |
 | `API_PORT` | API server port | `8000` |
+| `USE_FIRESTORE` | Enable Firestore persistence | `true` |
+| `FIRESTORE_PROJECT_ID` | Firestore project (defaults to GOOGLE_CLOUD_PROJECT) | `-` |
+| `FIRESTORE_TRIPS_COLLECTION` | Firestore collection for trips | `trips` |
 
 ### Getting Your API Keys
 
@@ -219,6 +222,52 @@ gcloud config set project YOUR_PROJECT_ID
    gcloud iam service-accounts keys create key.json \
      --iam-account=trip-planner-ai@PROJECT_ID.iam.gserviceaccount.com
    ```
+
+### Firestore Setup
+
+1. Enable Firestore in your Google Cloud project (Native mode)
+2. Ensure Application Default Credentials are available (gcloud or service account key)
+3. Configure `.env`:
+
+```
+USE_FIRESTORE=true
+FIRESTORE_PROJECT_ID=YOUR_PROJECT_ID  # optional; defaults to GOOGLE_CLOUD_PROJECT
+FIRESTORE_TRIPS_COLLECTION=trips
+```
+
+On successful trip generation, the API will store the full request and response under `trips/{trip_id}`.
+
+#### Using a Different Project for Firestore (Split-Project)
+
+If your Vertex AI/Places project differs from your Firebase/Firestore project, configure split credentials:
+
+1) In the Firestore project:
+- Enable APIs: Firestore API
+- Create a Service Account (e.g., `trip-planner-firestore-writer`) with roles:
+  - `Cloud Datastore User`
+  - `Datastore Owner` (or granular write roles if you prefer minimum privileges)
+- Create and download a JSON key file for this service account and store it securely.
+
+2) In `.env` set:
+
+```
+# Vertex/Places project
+GOOGLE_CLOUD_PROJECT=vertex-project-id
+GOOGLE_MAPS_API_KEY=your-places-api-key
+
+# Firestore project (different)
+USE_FIRESTORE=true
+FIRESTORE_PROJECT_ID=firebase-firestore-project-id
+FIRESTORE_CREDENTIALS=C:\\absolute\\path\\to\\firestore-service-account.json
+# Optional: choose a non-default database if you use one
+FIRESTORE_DATABASE_ID=(default)
+FIRESTORE_TRIPS_COLLECTION=trips
+```
+
+Notes:
+- On Windows, use escaped backslashes in the path or forward slashes.
+- When `FIRESTORE_CREDENTIALS` is set, the app uses this key only for Firestore, while Vertex AI continues to use `GOOGLE_APPLICATION_CREDENTIALS`/gcloud ADC tied to `GOOGLE_CLOUD_PROJECT`.
+- If `FIRESTORE_DATABASE_ID` is omitted, the default database is used.
 
 ## API Response Structure
 

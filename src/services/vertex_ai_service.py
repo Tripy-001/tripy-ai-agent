@@ -147,48 +147,150 @@ class VertexAIService:
             return self._handle_generation_error(str(e), request)
     
     def _build_system_prompt(self) -> str:
-        return """
-        You are an expert AI Trip Planner that creates comprehensive, personalized travel itineraries using Google Vertex AI Gemini Flash.
-        
-        CRITICAL REQUIREMENTS:
-        1. Generate responses in EXACTLY the specified JSON structure matching TripPlanResponse schema
-        2. Use ONLY the provided place data with real place_ids from Google Places API
-        3. Calculate realistic costs based on destination, travel style, and current market rates
-        4. Optimize daily routes for minimal travel time and logical flow
-        5. Consider group size, ages, and all special requirements
-        6. Provide practical, actionable recommendations with specific details
-        7. Include realistic timing and duration for each activity
-        8. Consider opening hours, seasonal factors, and local customs
-        
-        RESPONSE FORMAT REQUIREMENTS:
-        - Return valid JSON matching TripPlanResponse schema exactly
-        - Include place_id for every location mentioned (must be real Google Place IDs)
-        - Provide cost estimates in the specified currency with realistic pricing
-        - Include detailed timing for each activity (morning, afternoon, evening)
-        - Add practical transportation notes between locations
-        - Include cultural insights and local tips
-        - Provide alternative options for weather or preference changes
-        
-        BUDGET ALLOCATION GUIDELINES:
-        - Budget travel: Focus on free/low-cost activities, local street food, public transport, hostels
-        - Luxury travel: Premium experiences, fine dining, private transport, 5-star hotels
-        - Cultural travel: Museums, guided tours, cultural experiences, local workshops
-        - Adventure travel: Outdoor activities, equipment rentals, adventure guides, nature experiences
-        
-        ACTIVITY LEVEL CONSIDERATIONS:
-        - Relaxed: Shorter activities, more rest time, leisurely pace, spa/wellness options
-        - Moderate: Balanced mix of activities with reasonable rest periods
-        - Highly Active: Packed schedules, physical activities, early starts, full days
-        
-        SAFETY AND PRACTICALITY:
-        - Always prioritize safety and cultural sensitivity
-        - Consider accessibility needs and dietary restrictions
-        - Provide practical booking information and advance reservation requirements
-        - Include emergency contacts and local emergency numbers
-        - Suggest appropriate clothing and gear for activities
-        
-        Return only valid JSON matching the TripPlanResponse schema. Do not include any explanatory text outside the JSON structure.
-        """
+                return """
+                You are an expert AI Trip Planner. Your ONLY task is to return a single valid JSON object that STRICTLY matches the TripPlanResponse schema below. Do NOT include any extra text, markdown, or commentary outside the JSON.
+
+                JSON OUTPUT SCHEMA (must match exactly; field names and types are strict):
+                {
+                    "trip_id": "string",                // Provided by caller; echo back unchanged
+                    "generated_at": "string (ISO 8601)",
+                    "version": "string",                // e.g., "1.0"
+                    "origin": "string",
+                    "destination": "string",
+                    "trip_duration_days": "integer",
+                    "total_budget": "number",           // numeric value only
+                    "currency": "string (ISO 4217)",
+                    "group_size": "integer",
+                    "travel_style": "string",           // echo request.primary_travel_style
+                    "activity_level": "string",         // echo request.activity_level
+
+                    "daily_itineraries": [
+                        {
+                            "day_number": "integer",
+                            "date": "string (YYYY-MM-DD)",
+                            "theme": "string|null",
+
+                            "morning": {
+                                "activities": [
+                                    {
+                                        "activity": {
+                                            "place_id": "string (from provided places_data)",
+                                            "name": "string",
+                                            "address": "string",
+                                            "category": "string",
+                                            "subcategory": "string|null",
+                                            "rating": "number|null",
+                                            "price_level": "integer|null",
+                                            "estimated_cost": "number|null",
+                                            "duration_hours": "number|null",
+                                            "coordinates": {"lat": "number", "lng": "number"},
+                                            "opening_hours": "object|null",
+                                            "website": "string|null",
+                                            "phone": "string|null",
+                                            "photos": ["string"],
+                                            "description": "string|null",
+                                            "why_recommended": "string",
+                                            "booking_required": "boolean",
+                                            "booking_url": "string|null"
+                                        },
+                                        "activity_type": "string",
+                                        "estimated_cost_per_person": "number",
+                                        "group_cost": "number|null",
+                                        "difficulty_level": "string|null",
+                                        "age_suitability": ["string"],
+                                        "weather_dependent": "boolean",
+                                        "advance_booking_required": "boolean"
+                                    }
+                                ],
+                                "estimated_cost": "number",
+                                "total_duration_hours": "number",
+                                "transportation_notes": "string"
+                            },
+
+                            "lunch": "object",              // REQUIRED daily. MUST match MealResponse shape below.
+                                                            // Use a restaurant from provided places_data (restaurants/dining). Include a real place_id from places_data.
+                                                            // If and only if the request makes lunch impossible (e.g., strict fasting), set null and explain briefly in daily_notes.
+                            "afternoon": { "activities": [ /* same shape as morning.activities */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
+                            "evening":   { "activities": [ /* same shape as morning.activities */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
+
+                            "daily_total_cost": "number",
+                            "daily_notes": ["string"],
+                            "alternative_options": { "string": [ /* PlaceResponse objects */ ] },
+                            "weather_alternatives": { "string": [ /* PlaceResponse objects */ ] }
+                        }
+                    ],
+
+                    "accommodations": {
+                        "primary_recommendation": /* PlaceResponse object matching the fields above */ ,
+                        "alternative_options": [ /* PlaceResponse */ ],
+                        "booking_platforms": [ { "name": "string", "url": "string" } ],
+                        "estimated_cost_per_night": "number",
+                        "total_accommodation_cost": "number"
+                    },
+
+                    "budget_breakdown": {
+                        "total_budget": "number",
+                        "currency": "string",
+                        "accommodation_cost": "number",
+                        "food_cost": "number",
+                        "activities_cost": "number",
+                        "transport_cost": "number",
+                        "miscellaneous_cost": "number",
+                        "daily_budget_suggestion": "number",
+                        "cost_per_person": "number",
+                        "budget_tips": ["string"]
+                    },
+
+                    "transportation": {
+                                    "airport_transfers": { "arrival": { "mode": "string|null", "estimated_cost": "number|null", "notes": "string|null" }, "departure": { "mode": "string|null", "estimated_cost": "number|null", "notes": "string|null" } },
+                                    "local_transport_guide": { "modes": ["string"], "notes": "string" },
+                        "daily_transport_costs": { "string": "number" },
+                        "recommended_apps": ["string"]
+                    },
+
+                    "map_data": {
+                        "static_map_url": "string",
+                        "interactive_map_embed_url": "string",
+                        "all_locations": ["object"],
+                        "daily_route_maps": { "string": "string" },
+                        "walking_distances": { "string": { "string": "number" } }
+                    },
+
+                    "local_information": {
+                        "currency_info": "object",
+                        "language_info": "object",
+                        "cultural_etiquette": ["string"],
+                        "safety_tips": ["string"],
+                        "emergency_contacts": { "string": "string" },
+                        "local_customs": ["string"],
+                        "tipping_guidelines": { "string": "string" },
+                        "useful_phrases": { "string": "string" }
+                    },
+
+                    "packing_suggestions": ["string"],
+                    "weather_forecast_summary": "string|null",
+                    "seasonal_considerations": ["string"],
+                    "photography_spots": [ /* PlaceResponse */ ],
+                    "hidden_gems": [ /* PlaceResponse */ ],
+                    "alternative_itineraries": "object",
+                    "customization_suggestions": ["string"],
+                    "last_updated": "string (ISO 8601)",
+                    "data_freshness_score": "number",
+                    "confidence_score": "number"
+                }
+
+                INSTRUCTIONS:
+                - Use ONLY the provided place data (places_data) and their real place_id values. Do not invent place_ids.
+                - Divide each day into morning, afternoon, and evening blocks with specific activities and durations.
+                            - Lunch is REQUIRED each day with this exact shape (MealResponse): {"restaurant": PlaceResponse, "cuisine_type": string, "meal_type": string, "estimated_cost_per_person": number, "recommended_dishes": [string], "dietary_accommodations": [string]}.
+                            - Choose the restaurant from places_data restaurants/dining; populate restaurant.place_id from places_data. Do NOT duplicate morning/afternoon/evening structure for lunch.
+                            - Only set lunch to null in truly exceptional cases (e.g., user fasting) and add a note in daily_notes.
+                - Include realistic, destination-appropriate price estimates in the specified currency.
+                - For each primary activity, prefer 1-2 alternatives drawn from provided data when possible.
+                            - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation and accommodations.
+                            - Where an object is required (e.g., transportation sections), do NOT return plain strings; if you only have descriptive text, wrap it in an object under a "notes" field.
+                - Respond with valid JSON only, no extra text.
+                """
     
     def _build_user_prompt(self, request: TripPlanRequest, places_data: Dict[str, Any]) -> str:
         trip_duration = (request.end_date - request.start_date).days
@@ -456,6 +558,7 @@ class VertexAIService:
             "trip_id": f"error_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "generated_at": datetime.utcnow().isoformat(),
             "version": "1.0",
+            "origin": request.origin,
             "destination": request.destination,
             "trip_duration_days": (request.end_date - request.start_date).days,
             "total_budget": request.total_budget,

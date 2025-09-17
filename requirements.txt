@@ -7,6 +7,7 @@ python-multipart>=0.0.6
 google-cloud-aiplatform>=1.38.0
 googlemaps>=4.10.0
 vertexai>=1.38.0
+google-cloud-firestore>=2.16.0
 
 # Database dependencies
 sqlalchemy>=2.0.0

@@ -104,7 +104,7 @@ class LocalInformationResponse(BaseModel):
     emergency_contacts: Dict[str, str] = Field(default_factory=dict)
     local_customs: List[str] = Field(default_factory=list)
     tipping_guidelines: Dict[str, str] = Field(default_factory=dict)
-    useful_phrases: Dict[str, str] = Field(default_factory=list)
+    useful_phrases: Dict[str, str] = Field(default_factory=dict)
 
 class TripPlanResponse(BaseModel):
     # Metadata
@@ -113,6 +113,7 @@ class TripPlanResponse(BaseModel):
     version: str = "1.0"
     
     # Trip Overview
+    origin:str
     destination: str
     trip_duration_days: int
     total_budget: Decimal
