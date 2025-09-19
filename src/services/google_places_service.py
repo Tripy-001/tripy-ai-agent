@@ -6,6 +6,15 @@ from datetime import datetime, timedelta
 import httpx
 from src.models.request_models import TripPlanRequest, TravelStyle, ActivityLevel, AccommodationType
 from src.models.place_models import PlaceCategory, EnhancedPlace, PlacesSearchResult
+from src.utils.config import get_settings
+
+# Optional Vertex AI import for lightweight research prompt
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel
+except Exception:  # keep service resilient if vertexai not available
+    vertexai = None
+    GenerativeModel = None
 
 class GooglePlacesService:
     def __init__(self, api_key: str):
@@ -15,8 +24,12 @@ class GooglePlacesService:
         self.rate_limit_delay = 0.1  # 100ms delay between calls
         self.http_client = httpx.Client(timeout=20.0)
         self.api_key = api_key
-        # Demo-friendly safeguard: hard cap total Places API calls per trip
-        self.max_calls_per_trip = 40
+        # Cap total Places API calls per trip (configurable); prefer richer data
+        try:
+            settings = get_settings()
+            self.max_calls_per_trip = int(getattr(settings, "MAX_API_CALLS_PER_REQUEST", 200))
+        except Exception:
+            self.max_calls_per_trip = 200
     
     def fetch_all_places_for_trip(self, request: TripPlanRequest) -> Dict[str, List[Dict]]:
         """Fetch all relevant places for the trip based on user preferences and requirements"""
@@ -30,6 +43,24 @@ class GooglePlacesService:
             
             self.logger.info(f"Fetching places (Places API v1) for {request.destination} at {coordinates}")
             
+            # Step 0: Lightweight AI research for iconic must-visit attractions
+            researched_attraction_names: List[str] = self._research_top_attractions(request.destination)
+            researched_attractions: List[Dict] = []
+            if researched_attraction_names:
+                for place_name in researched_attraction_names:
+                    # Targeted search for each researched name
+                    results = self._places_search_text_v1(
+                        text_query=f"{place_name} in {request.destination}",
+                        coordinates=coordinates,
+                        radius=20000,
+                        page_size=10
+                    )
+                    for p in results[:3]:
+                        t = self._transform_place_v1(p)
+                        if t:
+                            researched_attractions.append(t)
+                researched_attractions = self._remove_duplicates(researched_attractions)
+
             places_data = {
                 "restaurants": [],
                 "attractions": [],
@@ -45,7 +76,7 @@ class GooglePlacesService:
             # Fetch places based on preferences and travel style
             # Prioritize accommodations first so we always have solid hotel candidates
             places_data["accommodations"] = self._fetch_accommodations(request, coordinates)
-            places_data["attractions"] = self._fetch_attractions(request, coordinates)
+            places_data["attractions"] = self._fetch_attractions(request, coordinates, researched_attractions)
             places_data["restaurants"] = self._fetch_restaurants(request, coordinates)
             
             # Fetch additional categories based on high preference scores
@@ -119,6 +150,7 @@ class GooglePlacesService:
             for restriction in request.dietary_restrictions[:2]:  # Limit to top 2
                 search_terms.append(f"{restriction} restaurants")
         
+        # Weight cuisines/diet preferences a bit higher by placing them later and scoring later
         for search_term in search_terms:
             results = self._places_search_text_v1(
                 text_query=f"{search_term} in {request.destination}",
@@ -131,11 +163,42 @@ class GooglePlacesService:
                 if place_details and self._matches_price_level(place_details, price_levels):
                     restaurants.append(place_details)
         
-        # Remove duplicates and return top results
+        # Remove duplicates
         unique_restaurants = self._remove_duplicates(restaurants)
-        return unique_restaurants[:25]
+
+        # Score and sort by rating, reviews, and cuisine alignment
+        must_try = set((request.must_try_cuisines or [])[:5])
+        dietary = set((request.dietary_restrictions or [])[:3])
+
+        def _score_rest(p: Dict) -> float:
+            rating = float(p.get('rating') or 0.0)
+            reviews = float(p.get('user_ratings_total') or 0)
+            name = (p.get('name') or '').lower()
+            addr = (p.get('address') or '').lower()
+            text = name + ' ' + addr
+            cuisine_boost = 0.0
+            for c in must_try:
+                if isinstance(c, str) and c.lower() in text:
+                    cuisine_boost += 10.0
+            for d in dietary:
+                if isinstance(d, str) and d.lower() in text:
+                    cuisine_boost += 6.0
+            return rating * 100 + min(reviews, 10000) * 0.03 + cuisine_boost
+
+        unique_restaurants.sort(key=_score_rest, reverse=True)
+        # Ensure minimal required fields exist (place_id, coordinates)
+        cleaned: List[Dict] = []
+        for r in unique_restaurants:
+            if not r.get('place_id'):
+                continue
+            coords = r.get('coordinates') or {}
+            if coords.get('lat') is None or coords.get('lng') is None:
+                continue
+            cleaned.append(r)
+
+        return cleaned[:25]
     
-    def _fetch_attractions(self, request: TripPlanRequest, coordinates: Tuple[float, float]) -> List[Dict]:
+    def _fetch_attractions(self, request: TripPlanRequest, coordinates: Tuple[float, float], researched_attractions: Optional[List[Dict]] = None) -> List[Dict]:
         """Fetch attractions based on user preferences"""
         attractions = []
         
@@ -178,8 +241,18 @@ class GooglePlacesService:
             if place_details:
                 attractions.append(place_details)
         
-        unique_attractions = self._remove_duplicates(attractions)
-        return unique_attractions[:30]
+        # Merge with researched iconic attractions, then de-duplicate and rank lightly
+        merged = attractions + (researched_attractions or [])
+        unique_attractions = self._remove_duplicates(merged)
+
+        def _score_attr(p: Dict) -> float:
+            rating = float(p.get('rating') or 0.0)
+            reviews = float(p.get('user_ratings_total') or 0)
+            # Prefer high-rating and crowd-validated spots
+            return rating * 100 + min(reviews, 20000) * 0.02
+
+        unique_attractions.sort(key=_score_attr, reverse=True)
+        return unique_attractions[:40]
     
     def _fetch_accommodations(self, request: TripPlanRequest, coordinates: Tuple[float, float]) -> List[Dict]:
         """Fetch accommodations based on type and travel style with richer diversity."""
@@ -411,7 +484,7 @@ class GooglePlacesService:
         """Use Places API v1 (New) places:searchText endpoint."""
         try:
             # Enforce per-trip API call limit
-            if self.api_calls_made >= self.max_calls_per_trip:
+            if self.max_calls_per_trip and self.api_calls_made >= self.max_calls_per_trip:
                 self.logger.info(
                     "Places API call skipped: max_calls_per_trip reached",
                     extra={"max_calls_per_trip": self.max_calls_per_trip}
@@ -445,6 +518,84 @@ class GooglePlacesService:
             return data.get("places", [])
         except Exception as e:
             self.logger.error(f"Places v1 searchText exception: {str(e)}")
+            return []
+
+    def _research_top_attractions(self, destination: str) -> List[str]:
+        """Use a lightweight Gemini prompt to list top must-visit attractions by name only.
+        Returns a JSON array of strings (place names). Fallback to [] on any error.
+        """
+        names: List[str] = []
+        try:
+            if not vertexai or not GenerativeModel:
+                return names
+
+            # Initialize Vertex AI from global settings
+            settings = get_settings()
+            try:
+                vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT, location=settings.GOOGLE_CLOUD_LOCATION)
+            except Exception:
+                # best-effort init; proceed
+                pass
+
+            model = GenerativeModel("gemini-2.5-flash")
+            research_prompt = (
+                f"""
+Act as a local travel expert for {destination}.
+List the top 10-15 must-visit attractions, including famous viewpoints, tea estates, dams, trekking spots, and unique experiences.
+Return ONLY a JSON array of strings. Example: ["Place Name 1", "Place Name 2", "Another Famous Spot"]
+"""
+            ).strip()
+
+            resp = model.generate_content(
+                [research_prompt],
+                generation_config={
+                    "temperature": 0.3,
+                    "response_mime_type": "application/json"
+                }
+            )
+
+            # Extract JSON array
+            text = None
+            try:
+                text = getattr(resp, "text", None)
+            except Exception:
+                text = None
+            if not text:
+                # Try candidates/parts aggregation
+                parts = []
+                for cand in getattr(resp, "candidates", []) or []:
+                    content = getattr(cand, "content", None)
+                    for part in getattr(content, "parts", []) or []:
+                        t = getattr(part, "text", None)
+                        if t:
+                            parts.append(t)
+                text = "\n".join(parts).strip() if parts else None
+
+            if not text:
+                return names
+
+            # Try direct JSON parsing, otherwise find first bracketed array
+            import json as _json, re as _re
+            try:
+                parsed = _json.loads(text)
+                if isinstance(parsed, list):
+                    names = [str(x) for x in parsed if isinstance(x, (str, int, float))]
+                    return names
+            except Exception:
+                pass
+
+            start = text.find('[')
+            end = text.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                try:
+                    parsed = _json.loads(text[start:end+1])
+                    if isinstance(parsed, list):
+                        names = [str(x) for x in parsed if isinstance(x, (str, int, float))]
+                        return names
+                except Exception:
+                    return names
+            return names
+        except Exception:
             return []
     
     def _transform_place_v1(self, place: Dict[str, any]) -> Optional[Dict]:

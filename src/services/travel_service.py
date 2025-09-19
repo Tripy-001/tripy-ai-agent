@@ -14,10 +14,11 @@ class TravelService:
         self.logger = logging.getLogger(__name__)
         self.client = httpx.Client(timeout=http_timeout)
 
-    def fetch_travel_options(self, origin: str, destination: str) -> List[Dict]:
+    def fetch_travel_options(self, origin: str, destination: str, total_budget: Optional[float] = None, currency: str = "USD", group_size: Optional[int] = None) -> List[Dict]:
         """
         Attempt to fetch flight/train options between origin and destination.
-        Returns a list of dicts with: {mode, details, estimated_cost, booking_link}.
+        Returns a list of dicts compatible with TravelOptionResponse.
+        Budget-aware: uses total_budget and group_size to prefer economical modes.
         If APIs are unavailable, returns an empty list.
         """
         options: List[Dict] = []
@@ -40,14 +41,129 @@ class TravelService:
 
             distance_km = self._haversine_km(olat, olng, dlat, dlng)
 
-            # 2) Heuristic options: if within ~600km, suggest train/bus; else flight
-            if distance_km <= 600:
-                # Try Wikidata SPARQL to find major stations near destination
-                stations = self._wikidata_find_transport_nodes(dlat, dlng)
-                options.extend(self._build_surface_transport_options(distance_km, stations))
-            else:
-                options.append(self._build_flight_option(distance_km, ocountry, dcountry))
+            # 2) Popular/common routes with budget tiers (Budget, Value, Comfort)
+            # Detect common hubs for well-known hill stations like Munnar
+            dest_lower = (destination or "").lower()
+            is_munnar = "munnar" in dest_lower
 
+            # Budget: Intercity bus (often overnight)
+            bus_opt = {
+                "mode": "bus",
+                "details": f"Approx. {int(distance_km)} km intercity bus. Common and budget-friendly.",
+                "estimated_cost": round(distance_km * 0.08, 2),
+                "booking_link": "https://www.redbus.in/",
+                "legs": [
+                    {
+                        "mode": "bus",
+                        "from_location": origin,
+                        "to_location": destination if is_munnar else "Destination city",
+                        "estimated_cost": round(distance_km * 0.08, 2),
+                        "duration_hours": round(distance_km / 60.0, 1),
+                        "booking_link": "https://www.redbus.in/",
+                        "notes": "Overnight sleeper coaches often available; verify drop point closest to town center."
+                    }
+                ]
+            }
+            # For Munnar specifically, buses typically reach Munnar town via Ernakulam/Adimali
+            if is_munnar:
+                bus_opt["mode"] = "multi-leg"
+                bus_opt["details"] = f"Intercity bus to Ernakulam/Adimali + hill bus/cab to Munnar. Approx. {int(distance_km)} km total."
+                bus_opt["legs"] = [
+                    {
+                        "mode": "bus",
+                        "from_location": origin,
+                        "to_location": "Ernakulam (Kochi)",
+                        "estimated_cost": round(distance_km * 0.07, 2),
+                        "duration_hours": round(distance_km / 55.0, 1),
+                        "booking_link": "https://www.redbus.in/",
+                        "notes": "Frequent overnight coaches to Ernakulam."
+                    },
+                    {
+                        "mode": "bus",
+                        "from_location": "Ernakulam",
+                        "to_location": "Munnar",
+                        "estimated_cost": 6.0,
+                        "duration_hours": 4.0,
+                        "booking_link": "https://www.rome2rio.com/",
+                        "notes": "Kerala SRTC hill buses operate via Adimali; cabs also available."
+                    }
+                ]
+            options.append(bus_opt)
+
+            # Value: Train to nearest rail hub + hill transfer
+            train_opt = {
+                "mode": "multi-leg",
+                "details": "Intercity train to nearest major rail hub + cab/bus to destination.",
+                "estimated_cost": round(distance_km * 0.15, 2),
+                "booking_link": "https://www.irctc.co.in/",
+                "legs": [
+                    {
+                        "mode": "train",
+                        "from_location": origin,
+                        "to_location": "Ernakulam Jn (ERS) / Aluva (AWY)" if is_munnar else "Nearest major rail hub",
+                        "estimated_cost": round(distance_km * 0.12, 2),
+                        "duration_hours": round(distance_km / 80.0, 1),
+                        "booking_link": "https://www.irctc.co.in/",
+                        "notes": "Book in advance; multiple classes available."
+                    },
+                    {
+                        "mode": "cab",
+                        "from_location": "Ernakulam/Aluva" if is_munnar else "Rail hub",
+                        "to_location": destination,
+                        "estimated_cost": 35.0 if is_munnar else 25.0,
+                        "duration_hours": 3.5 if is_munnar else 1.0,
+                        "booking_link": None,
+                        "notes": "Hill transfer by cab or KSRTC bus as available."
+                    }
+                ]
+            }
+            options.append(train_opt)
+
+            # Comfort: Flight to nearest airport + cab
+            flight_base = self._build_flight_option(distance_km, ocountry, dcountry)
+            flight_opt = {
+                "mode": "multi-leg",
+                "details": ("Flight to COK + cab to Munnar" if is_munnar else flight_base.get("details")),
+                "estimated_cost": flight_base.get("estimated_cost"),
+                "booking_link": flight_base.get("booking_link"),
+                "legs": [
+                    {
+                        "mode": "flight",
+                        "from_location": origin,
+                        "to_location": "Cochin International Airport (COK)" if is_munnar else destination,
+                        "estimated_cost": flight_base.get("estimated_cost"),
+                        "duration_hours": round(distance_km / 700.0, 2),
+                        "booking_link": flight_base.get("booking_link"),
+                        "notes": "Choose morning flights for more same-day sightseeing time."
+                    },
+                    {
+                        "mode": "cab",
+                        "from_location": "COK" if is_munnar else "Airport",
+                        "to_location": destination,
+                        "estimated_cost": 45.0 if is_munnar else 25.0,
+                        "duration_hours": 3.5 if is_munnar else 0.75,
+                        "booking_link": None,
+                        "notes": "Prepaid taxi counters available at airport; buses exist but less frequent."
+                    }
+                ]
+            }
+            options.append(flight_opt)
+
+            # Budget heuristic: if budget per person is very low, reorder to prefer bus/train
+            try:
+                per_person = None
+                if total_budget and group_size:
+                    per_person = float(total_budget) / max(1, int(group_size))
+                if per_person is not None and per_person < 200:  # arbitrary threshold
+                    options = sorted(options, key=lambda o: (o.get("estimated_cost") or 0))
+            except Exception:
+                pass
+
+            # Order by estimated cost ascending to align with budget-first presentation
+            try:
+                options = sorted(options, key=lambda o: (o.get("estimated_cost") or 0))
+            except Exception:
+                pass
             return options
         except Exception as e:
             self.logger.warning(f"Travel options fetch error: {str(e)}")
@@ -115,15 +231,37 @@ class TravelService:
         return [
             {
                 "mode": "train",
-                "details": f"Approx. {int(distance_km)} km. Typical intercity train available.",
+                "details": f"Approx. {int(distance_km)} km. Typical intercity train available. {notes}",
                 "estimated_cost": train_cost,
-                "booking_link": "https://www.ixigo.com/trains"  # public aggregator
+                "booking_link": "https://www.ixigo.com/trains",
+                "legs": [
+                    {
+                        "mode": "train",
+                        "from_location": "Origin city",
+                        "to_location": "Destination city",
+                        "estimated_cost": train_cost,
+                        "duration_hours": round(distance_km / 90.0, 1),
+                        "booking_link": "https://www.ixigo.com/trains",
+                        "notes": notes
+                    }
+                ]
             },
             {
                 "mode": "bus",
-                "details": f"Approx. {int(distance_km)} km. Intercity bus coaches available.",
+                "details": f"Approx. {int(distance_km)} km. Intercity bus coaches available. {notes}",
                 "estimated_cost": bus_cost,
-                "booking_link": "https://www.redbus.in/"  # popular operator in India
+                "booking_link": "https://www.redbus.in/",
+                "legs": [
+                    {
+                        "mode": "bus",
+                        "from_location": "Origin city",
+                        "to_location": "Destination city",
+                        "estimated_cost": bus_cost,
+                        "duration_hours": round(distance_km / 65.0, 1),
+                        "booking_link": "https://www.redbus.in/",
+                        "notes": notes
+                    }
+                ]
             },
         ]
 

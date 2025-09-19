@@ -180,6 +180,7 @@ class VertexAIService:
                                             "category": "string",
                                             "subcategory": "string|null",
                                             "rating": "number|null",
+                                            "user_ratings_total": "integer|null",
                                             "price_level": "integer|null",
                                             "estimated_cost": "number|null",
                                             "duration_hours": "number|null",
@@ -200,22 +201,27 @@ class VertexAIService:
                                         "age_suitability": ["string"],
                                         "weather_dependent": "boolean",
                                         "advance_booking_required": "boolean"
-                                    }
+                                    },
+                                    // To represent meals, include an activity of type "meal" with PlaceResponse pointing to a restaurant or cafe and a clear meal note in description/why_recommended.
                                 ],
                                 "estimated_cost": "number",
                                 "total_duration_hours": "number",
                                 "transportation_notes": "string"
                             },
 
-                            "lunch": "object",              // REQUIRED daily. MUST match MealResponse shape below.
-                                                            // Use a restaurant from provided places_data (restaurants/dining). Include a real place_id from places_data.
-                                                            // If and only if the request makes lunch impossible (e.g., strict fasting), set null and explain briefly in daily_notes.
-                            "afternoon": { "activities": [ /* same shape as morning.activities */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
-                            "evening":   { "activities": [ /* same shape as morning.activities */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
+                            "afternoon": { "activities": [ /* same shape as morning.activities; include lunch as a meal activity when appropriate */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
+                            "evening":   { "activities": [ /* same shape as morning.activities; include dinner as a meal activity when appropriate */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
 
                             "daily_total_cost": "number",
                             "daily_notes": ["string"],
-                            "alternative_options": { "string": [ /* PlaceResponse objects */ ] },
+                            // Provide structured daily alternatives:
+                            // - attractions: additional sights/activities for this day
+                            // - meals: additional restaurants/cafes for breakfast/lunch/dinner swaps
+                            // Each entry must be a full PlaceResponse (with real place_id, coordinates, rating and user_ratings_total when available) and include a helpful why_recommended.
+                            "alternative_options": {
+                                "attractions": [ /* PlaceResponse objects */ ],
+                                "meals": [ /* PlaceResponse objects (restaurants/cafes) */ ]
+                            },
                             "weather_alternatives": { "string": [ /* PlaceResponse objects */ ] }
                         }
                     ],
@@ -267,6 +273,26 @@ class VertexAIService:
                         "useful_phrases": { "string": "string" }
                     },
 
+                    "travel_options": [
+                        {
+                            "mode": "string",                 // flight, train, bus, multi-leg
+                            "details": "string|null",
+                            "estimated_cost": "number|null",
+                            "booking_link": "string|null",
+                            "legs": [
+                                {
+                                    "mode": "string",       // flight, train, bus, cab
+                                    "from_location": "string|null",
+                                    "to_location": "string|null",
+                                    "estimated_cost": "number|null",
+                                    "duration_hours": "number|null",
+                                    "booking_link": "string|null",
+                                    "notes": "string|null"
+                                }
+                            ]
+                        }
+                    ],
+
                     "packing_suggestions": ["string"],
                     "weather_forecast_summary": "string|null",
                     "seasonal_considerations": ["string"],
@@ -280,16 +306,40 @@ class VertexAIService:
                 }
 
                 INSTRUCTIONS:
-                - Use ONLY the provided place data (places_data) and their real place_id values. Do not invent place_ids.
-                - Divide each day into morning, afternoon, and evening blocks with specific activities and durations.
-                            - Lunch is REQUIRED each day with this exact shape (MealResponse): {"restaurant": PlaceResponse, "cuisine_type": string, "meal_type": string, "estimated_cost_per_person": number, "recommended_dishes": [string], "dietary_accommodations": [string]}.
-                            - Choose the restaurant from places_data restaurants/dining; populate restaurant.place_id from places_data. Do NOT duplicate morning/afternoon/evening structure for lunch.
-                            - Only set lunch to null in truly exceptional cases (e.g., user fasting) and add a note in daily_notes.
-                - Include realistic, destination-appropriate price estimates in the specified currency.
-                - For each primary activity, prefer 1-2 alternatives drawn from provided data when possible.
-                            - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation and accommodations.
-                            - Where an object is required (e.g., transportation sections), do NOT return plain strings; if you only have descriptive text, wrap it in an object under a "notes" field.
-                - Respond with valid JSON only, no extra text.
+                                                                - YOUR MOST IMPORTANT RULE: You MUST ONLY use places and their real `place_id` values from the provided `places_data`. NEVER invent, simulate, or create a placeholder `place_id` (e.g., 'simulated_restaurant_1', 'generic_place'). Every single activity in the itinerary must map to a real entry in the provided `places_data`. Failure to do so will result in an invalid response.
+                                                                - Use ONLY the provided place data (places_data) and their real place_id values. Do not invent place_ids. Never output placeholders like "generic_*" or activities without a valid place_id and coordinates.
+                                                                - Daily activities must be concise and PLACE-ONLY:
+                                                                    - Include only real places such as tourist attractions, viewpoints, museums, cultural centers, gardens/parks, markets/shops, restaurants, or cafes.
+                                                                    - Do NOT include transport or accommodation as activities. Travel and hotel check-in/out should be reflected in descriptions/notes, not as separate activities.
+                                                                    - Keep each time block short (generally 1–2 activities max). Use the activity description to add connective logic like “depart from hotel…”, “arrive from origin…”, or “return to hotel…”.
+                                                                - Enforce a rhythmic daily flow blending sightseeing and culinary variety:
+                                                                    - Morning: include a distinct breakfast as a meal activity (restaurant/cafe) followed by 1 sightseeing/activity.
+                                                                    - Afternoon: lunch at a different venue near the morning/afternoon sights, then 1 sightseeing/activity.
+                                                                    - Evening: a wind-down stop (viewpoint/market/park/cafe) followed by dinner at a unique venue.
+                                                                    - All breakfast, lunch, and dinner recommendations MUST be chosen from the `restaurants` list in the provided `places_data`.
+                                                                    - Never repeat the same restaurant in a trip day; avoid repeating the same cuisine within the same day when options exist.
+                                                                    - Prefer higher-quality dining: when data exists, select restaurants/cafes with rating >= 4.2 and user_ratings_total >= 300; otherwise choose the best available in places_data.
+                                                                    - Use must_try_cuisines and dietary_restrictions to diversify meal choices across days; mention signature dishes in why_recommended when relevant.
+                                                                - Represent meals (breakfast, lunch, dinner) as activities within the appropriate blocks, using restaurants or cafes from places_data with real place_ids. Use activity_type="meal" and estimate costs per person in the specified currency. Include rating and user_ratings_total in PlaceResponse when available.
+                                                                - Provide structured daily alternatives:
+                                                                    - alternative_options.attractions: 2–4 additional sights for the day, full PlaceResponse, each with why_recommended.
+                                                                    - alternative_options.meals: 2–4 additional restaurants/cafes suitable for that day’s meals, full PlaceResponse with cuisine angle in description/why_recommended.
+                                                                - Include realistic, destination-appropriate price estimates in the specified currency.
+                                                                - For each primary activity, prefer 1–2 alternatives drawn from provided data when possible.
+                                                                - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation, accommodations, and the travel_options array.
+                                                                - Travel options rules (popular/common routes, budget-tiered alternatives):
+                                                                    - Provide 2–3 alternatives ordered by typical budget bands (Budget, Value, Comfort).
+                                                                    - Budget: Typically an overnight intercity bus to the nearest major hub or directly to the destination if available.
+                                                                    - Value: Intercity train to the nearest major rail hub + hill bus/cab.
+                                                                    - Comfort: Flight to the nearest major airport + cab to destination.
+                                                                    - Use popular/common hubs only (e.g., for Munnar use Cochin International Airport (COK) and Aluva/Ernakulam for rail). Avoid remote/obscure towns that are not commonly used.
+                                                                    - If no direct flight is practical, return a multi-leg plan with a final cab/bus/train leg to the destination center.
+                                                                    - Provide booking_link placeholders to generic aggregators when exact operators are unknown.
+                                                                - Itinerary should start after arrival and end with departure:
+                                                                    - Align Day 1 morning to begin post-arrival window; avoid scheduling activities before a late arrival.
+                                                                    - On the last day, include realistic wrap-up activities only if time permits before departure.
+                                                                - Where an object is required (e.g., transportation sections), do NOT return plain strings; if you only have descriptive text, wrap it in an object under a "notes" field.
+                                                                - Respond with valid JSON only, no extra text.
                 """
     
     def _build_user_prompt(self, request: TripPlanRequest, places_data: Dict[str, Any]) -> str:
@@ -299,6 +349,7 @@ class VertexAIService:
         Create a comprehensive trip plan with the following requirements:
         
         TRIP DETAILS:
+        - Origin: {request.origin}
         - Destination: {request.destination}
         - Dates: {request.start_date} to {request.end_date}
         - Duration: {trip_duration} days
@@ -326,10 +377,14 @@ class VertexAIService:
         {json.dumps(places_data, indent=2)}
         
         Generate a complete trip plan following the TripPlanResponse schema exactly.
-        Ensure all costs are realistic for {request.destination} and match the {request.primary_travel_style} travel style.
-        Use only the place_ids provided in the places_data - do not make up any place IDs.
-        Create a logical daily flow that considers travel time between locations.
-        Include practical tips, local customs, and cultural insights for {request.destination}.
+        - Keep daily activities concise and place-only (1–2 real places per time block). No transport or accommodation as activities.
+        - Use the origin and travel_options (or travel_to_destination fallback) to determine arrival timing and departure flow.
+        - Ensure all costs are realistic for {request.destination} and match the {request.primary_travel_style} travel style.
+        - Use only the place_ids provided in the places_data – do not make up any place IDs; never output placeholders like generic_*.
+        - Create a logical daily flow that considers travel time between locations; put connective logic in each activity's description.
+        - Include practical tips, local customs, and cultural insights for {request.destination}.
+    - Emphasize a rhythmic daily flow—breakfast → explore → lunch → explore → evening wind-down → dinner—with meals chosen from places_data, favoring high ratings and strong review counts; vary cuisines using must_try_cuisines and don’t repeat restaurants.
+    - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary, including all alternatives, is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
         """
 
     def _extract_response_text(self, response: Any) -> Optional[str]:

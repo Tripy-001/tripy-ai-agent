@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from decimal import Decimal
 from src.models.request_models import TripPlanRequest
@@ -49,7 +49,13 @@ class ItineraryGeneratorService:
             # Step 2: Fetch travel-to-destination options
             try:
                 origin = request.origin
-                travel_options = self.travel_service.fetch_travel_options(origin=origin, destination=request.destination)
+                travel_options = self.travel_service.fetch_travel_options(
+                    origin=origin,
+                    destination=request.destination,
+                    total_budget=float(request.total_budget),
+                    currency=request.budget_currency,
+                    group_size=int(request.group_size)
+                )
                 places_data["travel_to_destination"] = travel_options
             except Exception as travel_err:
                 self.logger.warning("[itinerary] Travel options fetch failed", extra={"error": str(travel_err)})
@@ -85,6 +91,16 @@ class ItineraryGeneratorService:
             except Exception as acc_fix_err:
                 self.logger.warning("[itinerary] Accommodation enforcement skipped", extra={"error": str(acc_fix_err)})
 
+            # Inject travel_options directly to the final response payload for validation
+            try:
+                if isinstance(trip_data, dict):
+                    trip_data.setdefault("travel_options", [])
+                    # If model returned an internal suggestion via places_data, prefer AI's structured response if present; otherwise, fallback to fetched options
+                    if not trip_data.get("travel_options"):
+                        trip_data["travel_options"] = places_data.get("travel_to_destination", [])
+            except Exception:
+                pass
+
             # Step 6: Validate and create response model directly against TripPlanResponse
             try:
                 # Minimal sanitation to handle common minor shape mismatches
@@ -114,6 +130,36 @@ class ItineraryGeneratorService:
     def _sanitize_trip_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Coerce a few common fields into expected shapes without transforming semantics."""
         try:
+            # Travel options: coerce to list of TravelOptionResponse-compatible dicts
+            tos = data.get("travel_options")
+            if isinstance(tos, list):
+                norm: List[Dict[str, Any]] = []
+                for opt in tos:
+                    if not isinstance(opt, dict):
+                        continue
+                    o = {
+                        "mode": opt.get("mode") or "multi-leg",
+                        "details": opt.get("details"),
+                        "estimated_cost": opt.get("estimated_cost"),
+                        "booking_link": opt.get("booking_link"),
+                        "legs": []
+                    }
+                    legs = opt.get("legs")
+                    if isinstance(legs, list):
+                        for leg in legs:
+                            if isinstance(leg, dict):
+                                o["legs"].append({
+                                    "mode": leg.get("mode") or o["mode"],
+                                    "from_location": leg.get("from_location"),
+                                    "to_location": leg.get("to_location"),
+                                    "estimated_cost": leg.get("estimated_cost"),
+                                    "duration_hours": leg.get("duration_hours"),
+                                    "booking_link": leg.get("booking_link"),
+                                    "notes": leg.get("notes"),
+                                })
+                    norm.append(o)
+                data["travel_options"] = norm
+
             def _coerce_place(place: Dict[str, Any], default_category: str, context: str) -> Dict[str, Any]:
                 if not isinstance(place, dict):
                     return place
@@ -144,22 +190,102 @@ class ItineraryGeneratorService:
                     place["booking_url"] = None
                 return place
 
-            # Daily itineraries: ensure lunch is either None or a MealResponse-shaped dict
+            # Helper: enforce that activity points to a real place; replace invalid/simulated/generic
+            def _enforce_real_place(activity: Dict[str, Any], fallback_lists: Dict[str, List[Dict]], target_type: str) -> Optional[Dict[str, Any]]:
+                try:
+                    act = activity or {}
+                    place = act.get("activity") or {}
+                    pid = place.get("place_id")
+                    coords = (place.get("coordinates") or {})
+                    has_coords = isinstance(coords, dict) and coords.get("lat") not in (None, 0.0) and coords.get("lng") not in (None, 0.0)
+                    invalid_pid = not isinstance(pid, str) or not pid or pid.startswith("generic_") or pid.startswith("simulated_")
+                    if not invalid_pid and has_coords:
+                        return activity
+                    # Choose fallback list based on target_type
+                    if target_type == "meal":
+                        candidates = fallback_lists.get("restaurants") or []
+                    else:
+                        candidates = (fallback_lists.get("attractions") or []) + (fallback_lists.get("outdoor_activities") or []) + (fallback_lists.get("cultural_sites") or [])
+                    if not candidates:
+                        return None
+                    # Prefer high rating and reviews
+                    def _score(p: Dict[str, Any]) -> float:
+                        return float(p.get("rating") or 0.0) * 100 + float(p.get("user_ratings_total") or 0) * 0.03
+                    best = sorted([c for c in candidates if c.get("place_id") and (c.get("coordinates") or {}).get("lat") is not None and (c.get("coordinates") or {}).get("lng") is not None], key=_score, reverse=True)
+                    if not best:
+                        return None
+                    b = best[0]
+                    # Build a new activity with same meta values but real place
+                    new_place = {
+                        "place_id": b.get("place_id"),
+                        "name": b.get("name"),
+                        "address": b.get("address"),
+                        "category": b.get("category") or ("meal" if target_type == "meal" else "attraction"),
+                        "subcategory": b.get("subcategory"),
+                        "rating": b.get("rating"),
+                        "price_level": b.get("price_level"),
+                        "estimated_cost": place.get("estimated_cost"),
+                        "duration_hours": place.get("duration_hours"),
+                        "coordinates": b.get("coordinates"),
+                        "opening_hours": b.get("opening_hours"),
+                        "website": b.get("website"),
+                        "phone": b.get("phone"),
+                        "photos": b.get("photos", []),
+                        "description": place.get("description") or ("Meal at a recommended spot" if target_type == "meal" else "Visit a popular local place"),
+                        "why_recommended": place.get("why_recommended") or ("Highly rated and popular with travelers"),
+                        "booking_required": place.get("booking_required", False),
+                        "booking_url": place.get("booking_url"),
+                        "user_ratings_total": b.get("user_ratings_total")
+                    }
+                    return {
+                        **activity,
+                        "activity": new_place,
+                        "activity_type": activity.get("activity_type") or ("meal" if target_type == "meal" else "attraction")
+                    }
+                except Exception:
+                    return None
+
+            # Daily itineraries: ensure morning/afternoon/evening have proper blocks
             itins = data.get("daily_itineraries")
             if isinstance(itins, list):
                 for day in itins:
                     if not isinstance(day, dict):
                         continue
-                    lunch = day.get("lunch")
-                    if lunch is not None:
-                        # If lunch is a string or an activity block-like dict, drop it
-                        if isinstance(lunch, str):
-                            day["lunch"] = None
-                        elif isinstance(lunch, dict):
-                            # If it's missing MealResponse keys, set to None
-                            required_meal_keys = {"restaurant", "cuisine_type", "meal_type", "estimated_cost_per_person"}
-                            if not required_meal_keys.issubset(lunch.keys()):
-                                day["lunch"] = None
+                    for slot in ("morning", "afternoon", "evening"):
+                        blk = day.get(slot)
+                        if not isinstance(blk, dict):
+                            day[slot] = {"activities": [], "estimated_cost": 0, "total_duration_hours": 0.0, "transportation_notes": ""}
+                        else:
+                            if not isinstance(blk.get("activities"), list):
+                                blk["activities"] = []
+                            if "estimated_cost" not in blk:
+                                blk["estimated_cost"] = 0
+                            if "total_duration_hours" not in blk:
+                                blk["total_duration_hours"] = 0.0
+                            if "transportation_notes" not in blk:
+                                blk["transportation_notes"] = ""
+
+                    # Enforce place-only activities and replace generics
+                    fallback_lists = {
+                        "restaurants": (data.get("restaurants") or []) + ((data.get("places_data") or {}).get("restaurants") or []),
+                        "attractions": (data.get("attractions") or []) + ((data.get("places_data") or {}).get("attractions") or []),
+                        "outdoor_activities": (data.get("outdoor_activities") or []) + ((data.get("places_data") or {}).get("outdoor_activities") or []),
+                        "cultural_sites": (data.get("cultural_sites") or []) + ((data.get("places_data") or {}).get("cultural_sites") or []),
+                    }
+                    for slot in ("morning", "afternoon", "evening"):
+                        blk = day.get(slot) or {}
+                        new_acts = []
+                        for act in blk.get("activities", []) or []:
+                            a_type = (act or {}).get("activity_type") or ""
+                            if a_type in ("transport", "accommodation"):
+                                # Drop non-place activities
+                                continue
+                            target_type = "meal" if a_type == "meal" else "place"
+                            fixed = _enforce_real_place(act, fallback_lists, target_type)
+                            if fixed:
+                                new_acts.append(fixed)
+                        # Keep it concise: max 2 activities per block
+                        blk["activities"] = new_acts[:2]
 
                     # Coerce alternative_options places
                     alt_opts = day.get("alternative_options")

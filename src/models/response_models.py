@@ -3,6 +3,22 @@ from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
 
+class TravelLegResponse(BaseModel):
+    mode: str  # flight, train, bus, cab, ferry
+    from_location: Optional[str] = None
+    to_location: Optional[str] = None
+    estimated_cost: Optional[Decimal] = None
+    duration_hours: Optional[float] = None
+    booking_link: Optional[str] = None
+    notes: Optional[str] = None
+
+class TravelOptionResponse(BaseModel):
+    mode: str  # primary mode or "multi-leg"
+    details: Optional[str] = None
+    estimated_cost: Optional[Decimal] = None
+    booking_link: Optional[str] = None
+    legs: List[TravelLegResponse] = Field(default_factory=list)
+
 class PlaceResponse(BaseModel):
     place_id: str
     name: str
@@ -10,6 +26,7 @@ class PlaceResponse(BaseModel):
     category: str
     subcategory: Optional[str] = None
     rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
     price_level: Optional[int] = None  # 1-4 scale
     estimated_cost: Optional[Decimal] = None
     duration_hours: Optional[float] = None
@@ -53,8 +70,6 @@ class DayItineraryResponse(BaseModel):
     #   "total_duration_hours": float,
     #   "transportation_notes": str
     # }
-    
-    lunch: Optional[MealResponse] = None
     
     afternoon: Dict[str, Any] = Field(default_factory=dict)
     evening: Dict[str, Any] = Field(default_factory=dict)
@@ -129,6 +144,7 @@ class TripPlanResponse(BaseModel):
     transportation: TransportationResponse
     map_data: MapDataResponse
     local_information: LocalInformationResponse
+    travel_options: List[TravelOptionResponse] = Field(default_factory=list)
     
     # Additional Features
     packing_suggestions: List[str] = Field(default_factory=list)
