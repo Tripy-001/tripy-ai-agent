@@ -55,84 +55,30 @@ class FirestoreManager:
         return value
 
     def _build_firestore_structure(self, request_data: Dict[str, Any], response_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Produce a structured Firestore document for trips.
-        Root doc stores general info. Per-day docs stored under subcollection 'days' as 'Day 1', 'Day 2', ...
-        The root payload returns minimal denormalized references for convenience.
+        """Produce a simplified Firestore document for trips.
+        Store the entire itinerary JSON object at the root under the key 'itinerary'.
+        No daywise subcollections are created in this mode.
         """
+        # Minimal root metadata can be included, but core is the itinerary blob
         root: Dict[str, Any] = {
-            "trip_id": response_data.get("trip_id"),
-            "generated_at": response_data.get("generated_at"),
-            "last_updated": response_data.get("last_updated"),
-            "version": response_data.get("version"),
-            "origin": response_data.get("origin"),
-            "destination": response_data.get("destination"),
-            "trip_duration_days": response_data.get("trip_duration_days"),
-            "total_budget": response_data.get("total_budget"),
-            "currency": response_data.get("currency"),
-            "group_size": response_data.get("group_size"),
-            "travel_style": response_data.get("travel_style"),
-            "activity_level": response_data.get("activity_level"),
-            "accommodations": response_data.get("accommodations"),
-            "budget_breakdown": response_data.get("budget_breakdown"),
-            "transportation": response_data.get("transportation"),
-            "map_data": response_data.get("map_data"),
-            "local_information": response_data.get("local_information"),
-            "travel_options": response_data.get("travel_options"),
-            "packing_suggestions": response_data.get("packing_suggestions"),
-            "weather_forecast_summary": response_data.get("weather_forecast_summary"),
-            "seasonal_considerations": response_data.get("seasonal_considerations"),
-            "photography_spots": response_data.get("photography_spots"),
-            "hidden_gems": response_data.get("hidden_gems"),
-            "alternative_itineraries": response_data.get("alternative_itineraries"),
-            "customization_suggestions": response_data.get("customization_suggestions"),
-            "data_freshness_score": response_data.get("data_freshness_score"),
-            "confidence_score": response_data.get("confidence_score"),
-            # convenience
-            "days_count": len(response_data.get("daily_itineraries") or []),
+            "itinerary": response_data,
         }
-
-        # Build subcollection docs for days
-        days: Dict[str, Dict[str, Any]] = {}
-        for d in (response_data.get("daily_itineraries") or []):
-            if not isinstance(d, dict):
-                continue
-            day_num = d.get("day_number")
-            key = f"Day {day_num}" if day_num is not None else f"Day {len(days)+1}"
-            day_doc: Dict[str, Any] = {
-                "day_number": d.get("day_number"),
-                "date": d.get("date"),
-                "theme": d.get("theme"),
-                "morning": d.get("morning"),
-                "afternoon": d.get("afternoon"),
-                "evening": d.get("evening"),
-                "daily_total_cost": d.get("daily_total_cost"),
-                "daily_notes": d.get("daily_notes"),
-                "alternative_options": d.get("alternative_options"),
-                "weather_alternatives": d.get("weather_alternatives"),
-            }
-            days[key] = day_doc
-
-        return {"root": self._sanitize_for_firestore(root), "days": {k: self._sanitize_for_firestore(v) for k, v in days.items()}}
+        return {"root": self._sanitize_for_firestore(root), "days": {}}
 
     async def save_trip_plan(self, trip_id: str, request_data: Dict[str, Any], response_data: Dict[str, Any]) -> bool:
         try:
             doc_ref = self._collection().document(trip_id)
-            # Build structured payloads: root doc + subcollection days
+            # Build simplified payload: entire itinerary JSON at root
             structured = self._build_firestore_structure(request_data, response_data)
             root_payload = structured["root"]
             root_payload.update({
                 "request": self._sanitize_for_firestore(request_data),
-                "response": self._sanitize_for_firestore(response_data),
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
-                "schema_version": 1,
+                "schema_version": 2,
             })
 
             doc_ref.set(root_payload)
-
-            # Write days subcollection
-            for day_key, day_doc in structured["days"].items():
-                doc_ref.collection("days").document(day_key).set(day_doc)
             self.logger.info(f"Saved trip {trip_id} to Firestore")
             return True
         except Exception as e:
@@ -158,13 +104,10 @@ class FirestoreManager:
             updates = structured["root"]
             updates.update({
                 "request": self._sanitize_for_firestore(request_data),
-                "response": self._sanitize_for_firestore(response_data),
                 "updated_at": datetime.utcnow().isoformat(),
+                "schema_version": 2,
             })
             doc_ref.update(updates)
-            # Upsert days
-            for day_key, day_doc in structured["days"].items():
-                doc_ref.collection("days").document(day_key).set(day_doc)
             self.logger.info(f"Updated trip {trip_id} in Firestore")
             return True
         except Exception as e:
@@ -177,14 +120,7 @@ class FirestoreManager:
             snap = doc_ref.get()
             if not snap.exists:
                 return False
-            # Delete days subcollection docs
-            try:
-                days = doc_ref.collection("days").stream()
-                for d in days:
-                    doc_ref.collection("days").document(d.id).delete()
-            except Exception as sub_e:
-                self.logger.warning(f"Failed deleting days subcollection for {trip_id}: {sub_e}")
-            # Delete root doc
+            # Delete root doc (no daywise subcollection maintained in v2)
             doc_ref.delete()
             self.logger.info(f"Deleted trip {trip_id} from Firestore")
             return True

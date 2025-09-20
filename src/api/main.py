@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -6,7 +6,9 @@ from fastapi.responses import JSONResponse
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Union
+from pydantic import BaseModel
+from google.cloud import firestore as gcf
 
 from src.models.request_models import TripPlanRequest
 from src.models.response_models import TripPlanResponse
@@ -127,9 +129,15 @@ def get_services():
         'fs': fs_manager
     }
 
-@app.post("/api/v1/generate-trip", response_model=TripPlanResponse)
+class TripGenerationRequest(BaseModel):
+    tripId: str
+    userInput: TripPlanRequest
+
+
+@app.post("/api/v1/generate-trip")
 async def generate_trip_plan(
-    request: TripPlanRequest
+    payload: Union[TripGenerationRequest, TripPlanRequest],
+    background_tasks: BackgroundTasks
 ):
     """
     Generate a comprehensive trip plan based on structured input
@@ -138,22 +146,29 @@ async def generate_trip_plan(
     using Google Vertex AI Gemini Flash model and Google Places API.
     """
     try:
+        # Distinguish legacy vs proxy flow
+        is_proxy_flow = isinstance(payload, TripGenerationRequest)
+        req: TripPlanRequest = payload.userInput if is_proxy_flow else payload
+        trip_id: str = payload.tripId if is_proxy_flow else str(uuid.uuid4())
+
         logger.info(
             "[generate-trip] Request received",
             extra={
-                "destination": request.destination,
-                "start_date": str(request.start_date),
-                "end_date": str(request.end_date),
-                "budget": request.total_budget,
-                "currency": request.budget_currency,
-                "group_size": request.group_size,
-                "style": str(request.primary_travel_style),
-                "activity": str(request.activity_level)
+                "trip_id": trip_id,
+                "destination": req.destination,
+                "start_date": str(req.start_date),
+                "end_date": str(req.end_date),
+                "budget": req.total_budget,
+                "currency": req.budget_currency,
+                "group_size": req.group_size,
+                "style": str(req.primary_travel_style),
+                "activity": str(req.activity_level),
+                "mode": "proxy" if is_proxy_flow else "legacy"
             }
         )
         
         # Validate the request
-        validation_result = TripRequestValidator.validate_complete_request(request)
+        validation_result = TripRequestValidator.validate_complete_request(req)
         logger.debug(
             "[generate-trip] Validation completed",
             extra={
@@ -164,14 +179,22 @@ async def generate_trip_plan(
         )
         
         if not validation_result['valid']:
-            raise HTTPException(
-                status_code=400, 
-                detail={
-                    "message": "Invalid request data",
-                    "errors": validation_result['errors'],
-                    "warnings": validation_result.get('warnings', [])
-                }
-            )
+            # If proxy flow, write failed status to Firestore and return 400
+            if is_proxy_flow and fs_manager is not None and get_settings().USE_FIRESTORE:
+                try:
+                    doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
+                    doc_ref.update({
+                        "status": "failed",
+                        "error": {"message": "Invalid request data", "details": validation_result['errors']},
+                        "updatedAt": gcf.SERVER_TIMESTAMP
+                    })
+                except Exception as fe:
+                    logger.warning("[generate-trip] Firestore write failed for invalid request", extra={"error": str(fe)})
+            raise HTTPException(status_code=400, detail={
+                "message": "Invalid request data",
+                "errors": validation_result['errors'],
+                "warnings": validation_result.get('warnings', [])
+            })
         
         # Debug: pre-check Google Maps key and geocoding
         try:
@@ -179,8 +202,8 @@ async def generate_trip_plan(
             maps_key = settings.GOOGLE_MAPS_API_KEY
             masked = f"{maps_key[:4]}...{maps_key[-4:]}" if maps_key and len(maps_key) > 8 else (maps_key or "<missing>")
             logger.info("[generate-trip] Maps API key (masked)", extra={"maps_key": masked})
-            logger.info("[generate-trip] Geocoding destination pre-check", extra={"destination": request.destination})
-            _coords = places_service._geocode_destination(request.destination)
+            logger.info("[generate-trip] Geocoding destination pre-check", extra={"destination": req.destination})
+            _coords = places_service._geocode_destination(req.destination)
             logger.info("[generate-trip] Geocoding result", extra={"coords": _coords if _coords else "<none>"})
             if not _coords:
                 raise HTTPException(status_code=502, detail="Geocoding failed: Could not resolve destination coordinates. Check GOOGLE_MAPS_API_KEY and quota.")
@@ -190,40 +213,70 @@ async def generate_trip_plan(
             logger.exception("[generate-trip] Geocoding pre-check error")
             raise HTTPException(status_code=502, detail=f"Geocoding pre-check error: {str(geo_e)}")
 
-        # Generate unique trip ID
-        trip_id = str(uuid.uuid4())
-        logger.info(f"Generated trip ID: {trip_id}")
-        
-        # Check for warnings and log them
-        if validation_result.get('warnings'):
-            logger.warning(f"Request warnings: {validation_result['warnings']}")
-        
-        # Generate trip plan
-        logger.info("[generate-trip] Starting itinerary generation", extra={"trip_id": trip_id})
-        trip_response = await itinerary_generator.generate_comprehensive_plan(request, trip_id)
-        logger.info(
-            "[generate-trip] Itinerary generation completed",
-            extra={
-                "trip_id": trip_id,
-                "days": getattr(trip_response, "trip_duration_days", None),
-                "itineraries_count": len(getattr(trip_response, "daily_itineraries", []) or []),
-                "accommodation_primary": getattr(getattr(trip_response, "accommodations", None), "primary_recommendation", None).name if getattr(trip_response, "accommodations", None) else None
-            }
-        )
-        
-        # Persist to Firestore if enabled; do not block response on failure
+        # Legacy path: synchronous generation & return TripPlanResponse
+        if not is_proxy_flow or not (get_settings().USE_FIRESTORE and fs_manager is not None):
+            # Generate trip synchronously (legacy behavior)
+            logger.info("[generate-trip] Starting itinerary generation (legacy)", extra={"trip_id": trip_id})
+            trip_response = await itinerary_generator.generate_comprehensive_plan(req, trip_id)
+            try:
+                settings = get_settings()
+                if settings.USE_FIRESTORE and fs_manager is not None:
+                    response_data: Dict[str, Any] = trip_response.model_dump(mode="json")
+                    request_data: Dict[str, Any] = req.model_dump(mode="json")
+                    # Persist flat itinerary JSON at root doc; no daywise subcollections
+                    doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
+                    # Merge to avoid clobbering fields the frontend may have already set
+                    doc_ref.set({
+                        "status": "completed",
+                        "request": request_data,
+                        "itinerary": response_data,
+                        "error": None,
+                        "updatedAt": gcf.SERVER_TIMESTAMP,
+                        "createdAt": gcf.SERVER_TIMESTAMP,
+                    }, merge=True)
+            except Exception as persist_e:
+                logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
+            return trip_response
+
+        # Proxy flow: update Firestore to processing and schedule background generation, return 202
         try:
-            settings = get_settings()
-            if settings.USE_FIRESTORE and fs_manager is not None:
-                # Serialize Pydantic models to JSON-safe dicts
-                response_data: Dict[str, Any] = trip_response.model_dump(mode="json")
-                request_data: Dict[str, Any] = request.model_dump(mode="json")
-                await fs_manager.save_trip_plan(trip_id, request_data, response_data)
-        except Exception as persist_e:
-            logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
-        
-        logger.info(f"Successfully generated trip plan {trip_id}")
-        return trip_response
+            doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
+            doc_ref.update({
+                "status": "processing",
+                "updatedAt": gcf.SERVER_TIMESTAMP
+            })
+        except Exception as fe:
+            logger.warning("[generate-trip] Firestore status update to processing failed", extra={"trip_id": trip_id, "error": str(fe)})
+
+        async def run_generation_and_update():
+            try:
+                trip_response = await itinerary_generator.generate_comprehensive_plan(req, trip_id)
+                itinerary_json: Dict[str, Any] = trip_response.model_dump(mode="json")
+                try:
+                    doc_ref.update({
+                        "status": "completed",
+                        "itinerary": itinerary_json,
+                        "error": None,
+                        "updatedAt": gcf.SERVER_TIMESTAMP
+                    })
+                    logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
+                except Exception as ue:
+                    logger.error("[generate-trip] Firestore completion update failed", extra={"trip_id": trip_id, "error": str(ue)})
+            except Exception as gen_e:
+                logger.exception("[generate-trip] Background generation failed")
+                try:
+                    doc_ref.update({
+                        "status": "failed",
+                        "error": str(gen_e),
+                        "updatedAt": gcf.SERVER_TIMESTAMP
+                    })
+                except Exception as ue2:
+                    logger.error("[generate-trip] Firestore failure update failed", extra={"trip_id": trip_id, "error": str(ue2)})
+
+        # Schedule background task
+        background_tasks.add_task(run_generation_and_update)
+
+        return JSONResponse(status_code=202, content={"tripId": trip_id, "status": "processing"})
         
     except HTTPException:
         raise
@@ -242,8 +295,11 @@ async def get_trip_plan(trip_id: str):
         if settings.USE_FIRESTORE and fs_manager is not None:
             trip_plan = await fs_manager.get_trip_plan(trip_id)
             if trip_plan:
-                # Support both new structured key 'response' and legacy 'response_data'
-                response_data = trip_plan.get('response') or trip_plan.get('response_data')
+                # New format stores entire itinerary under 'itinerary'
+                response_data = trip_plan.get('itinerary')
+                # Back-compat fallbacks
+                if not response_data:
+                    response_data = trip_plan.get('response') or trip_plan.get('response_data')
                 if not response_data:
                     raise HTTPException(status_code=404, detail="Trip plan not found")
                 return TripPlanResponse(**response_data)
