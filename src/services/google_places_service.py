@@ -498,7 +498,8 @@ class GooglePlacesService:
                     "places.id,places.displayName,places.formattedAddress,"
                     "places.location,places.rating,places.userRatingCount,"
                     "places.priceLevel,places.types,places.websiteUri,"
-                    "places.internationalPhoneNumber,places.googleMapsUri"
+                    "places.internationalPhoneNumber,places.googleMapsUri,"
+                    "places.photos"
                 )
             }
             body: Dict[str, any] = {"textQuery": text_query, "pageSize": page_size}
@@ -601,6 +602,16 @@ Return ONLY a JSON array of strings. Example: ["Place Name 1", "Place Name 2", "
     def _transform_place_v1(self, place: Dict[str, any]) -> Optional[Dict]:
         """Transform Places API v1 place into our standardized structure."""
         try:
+            # Build photo URLs from v1 media endpoint when available
+            photos_urls = []
+            for ph in place.get('photos', []) or []:
+                name = ph.get('name')  # e.g., places/PLACE_ID/photos/PHOTO_ID
+                if name:
+                    # Publicly retrievable image via media endpoint; include API key
+                    url = f"https://places.googleapis.com/v1/{name}/media?maxWidthPx=800&key={self.api_key}"
+                    photos_urls.append(url)
+            if len(photos_urls) > 5:
+                photos_urls = photos_urls[:5]
             return {
                 'place_id': place.get('id'),
                 'name': (place.get('displayName') or {}).get('text'),
@@ -612,7 +623,7 @@ Return ONLY a JSON array of strings. Example: ["Place Name 1", "Place Name 2", "
                 'rating': place.get('rating'),
                 'price_level': place.get('priceLevel'),
                 'opening_hours': None,
-                'photos': [],
+                'photos': photos_urls,
                 'website': place.get('websiteUri'),
                 'phone': place.get('internationalPhoneNumber'),
                 'types': place.get('types', []),

@@ -27,7 +27,16 @@ class FirestoreManager:
             # Use explicit creds or fall back to ADC
             self.client = firestore.Client(project=project_id, credentials=credentials, database=database)
             self.collection_name = self.settings.FIRESTORE_TRIPS_COLLECTION or "trips"
-            self.logger.info("Initialized Firestore client", extra={"project": project_id, "collection": self.collection_name, "database": database or "(default)"})
+            self.public_collection_name = self.settings.FIRESTORE_PUBLIC_TRIPS_COLLECTION or "public_trips"
+            self.logger.info(
+                "Initialized Firestore client",
+                extra={
+                    "project": project_id,
+                    "collection": self.collection_name,
+                    "public_collection": self.public_collection_name,
+                    "database": database or "(default)"
+                }
+            )
         except Exception as e:
             self.logger.exception("Failed to initialize Firestore client")
             raise
@@ -126,4 +135,54 @@ class FirestoreManager:
             return True
         except Exception as e:
             self.logger.error(f"Firestore delete failed for {trip_id}: {e}")
+            return False
+
+    # --- Public trips helpers ---
+    def _public_collection(self):
+        return self.client.collection(self.public_collection_name)
+
+    def _scrub_for_public(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of data without any potentially sensitive user identifiers.
+        We deliberately omit explicit user-id fields if present.
+        """
+        safe = dict(data or {})
+        for k in ["user_id", "uid", "owner", "email", "phone", "auth"]:
+            if k in safe:
+                safe.pop(k, None)
+        return safe
+
+    async def save_public_trip(self, trip_id: str, request_data: Dict[str, Any], itinerary_data: Dict[str, Any],
+                               title: str, summary: str, thumbnail_url: str) -> bool:
+        """Create or update a public copy of a trip for discovery.
+
+        Schema:
+        - itinerary: <TripPlanResponse JSON>
+        - request: <TripPlanRequest JSON>
+        - title: string
+        - summary: string
+        - thumbnail_url: string
+        - created_at/updated_at ISO timestamps
+        - source_trip_id: original trip id (non-sensitive)
+        """
+        try:
+            doc_ref = self._public_collection().document(trip_id)
+            payload = {
+                "itinerary": self._sanitize_for_firestore(itinerary_data),
+                "request": self._sanitize_for_firestore(self._scrub_for_public(request_data)),
+                "title": title,
+                "summary": summary,
+                "thumbnail_url": thumbnail_url,
+                "source_trip_id": trip_id,
+                "updated_at": datetime.utcnow().isoformat(),
+                "schema_version": 1,
+            }
+            # Upsert; add created_at if new
+            snap = doc_ref.get()
+            if not snap.exists:
+                payload["created_at"] = datetime.utcnow().isoformat()
+            doc_ref.set(payload, merge=True)
+            self.logger.info(f"Saved public trip {trip_id} to Firestore")
+            return True
+        except Exception as e:
+            self.logger.error(f"Firestore public save failed for {trip_id}: {e}")
             return False

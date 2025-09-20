@@ -50,22 +50,16 @@ class TripRequestValidator:
         """Validate budget parameters"""
         errors = []
         
-        # Check minimum budget
-        if total_budget < 100:
-            errors.append("Minimum budget is $100")
+        # Allow any non-negative budget; no hard min/max constraints
+        if total_budget < 0:
+            errors.append("Budget cannot be negative")
         
-        # Check maximum budget
-        if total_budget > 100000:
-            errors.append("Maximum budget is $100,000")
+        # Accept 3-letter currency codes case-insensitively (e.g., usd, inr, eur)
+        if not re.match(r"^[A-Za-z]{3}$", currency or ""):
+            errors.append("Currency must be a 3-letter code (e.g., USD, EUR, INR)")
         
-        # Check currency format
-        if not re.match(r"^[A-Z]{3}$", currency):
-            errors.append("Currency must be a 3-letter code (e.g., USD, EUR)")
-        
-        # Check budget per person
-        budget_per_person = total_budget / group_size
-        if budget_per_person < 50:
-            errors.append(f"Budget per person (${budget_per_person:.2f}) is too low for a meaningful trip")
+        # Compute budget per person for downstream use (no constraint enforced here)
+        budget_per_person = (total_budget / group_size) if group_size else 0
         
         return {
             'valid': len(errors) == 0,
@@ -112,11 +106,6 @@ class TripRequestValidator:
         for pref_name, score in preferences.items():
             if not isinstance(score, int) or score < 1 or score > 5:
                 errors.append(f"{pref_name} preference must be between 1 and 5")
-        
-        # Check if all preferences are the same (might indicate user didn't customize)
-        unique_scores = set(preferences.values())
-        if len(unique_scores) == 1:
-            errors.append("All preferences have the same score. Please customize your preferences for better recommendations.")
         
         # Calculate preference diversity
         preference_variance = sum((score - 3)**2 for score in preferences.values()) / len(preferences)

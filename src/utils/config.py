@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     FIRESTORE_DATABASE_ID: Optional[str] = None  # defaults to '(default)'
     USE_FIRESTORE: bool = True
     FIRESTORE_TRIPS_COLLECTION: str = "trips"
+    FIRESTORE_PUBLIC_TRIPS_COLLECTION: str = "public_trips"
     
     # Database Configuration (SQL removed)
     

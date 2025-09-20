@@ -227,6 +227,19 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP,
                         "createdAt": gcf.SERVER_TIMESTAMP,
                     }, merge=True)
+                    # Also create/update a public copy of the trip (non-blocking)
+                    try:
+                        title, summary, thumbnail = _compute_public_metadata(response_data)
+                        await fs_manager.save_public_trip(
+                            trip_id=trip_id,
+                            request_data=request_data,
+                            itinerary_data=response_data,
+                            title=title,
+                            summary=summary,
+                            thumbnail_url=thumbnail,
+                        )
+                    except Exception as pub_e:
+                        logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
             except Exception as persist_e:
                 logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
             return trip_response
@@ -253,6 +266,19 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP
                     })
                     logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
+                    # Save public copy as well (non-blocking)
+                    try:
+                        title, summary, thumbnail = _compute_public_metadata(itinerary_json)
+                        await fs_manager.save_public_trip(
+                            trip_id=trip_id,
+                            request_data=req.model_dump(mode="json"),
+                            itinerary_data=itinerary_json,
+                            title=title,
+                            summary=summary,
+                            thumbnail_url=thumbnail,
+                        )
+                    except Exception as pub_e:
+                        logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
                 except Exception as ue:
                     logger.error("[generate-trip] Firestore completion update failed", extra={"trip_id": trip_id, "error": str(ue)})
             except Exception as gen_e:
@@ -341,11 +367,26 @@ async def regenerate_trip_plan(
         # Persist updated plan (non-blocking)
         try:
             if settings.USE_FIRESTORE and fs_manager is not None:
+                req_json = request.model_dump(mode="json")
+                upd_json = updated_trip.model_dump(mode="json")
                 await fs_manager.update_trip_plan(
                     trip_id,
-                    request.model_dump(mode="json"),
-                    updated_trip.model_dump(mode="json")
+                    req_json,
+                    upd_json
                 )
+                # Update public copy as well (non-blocking)
+                try:
+                    title, summary, thumbnail = _compute_public_metadata(upd_json)
+                    await fs_manager.save_public_trip(
+                        trip_id=trip_id,
+                        request_data=req_json,
+                        itinerary_data=upd_json,
+                        title=title,
+                        summary=summary,
+                        thumbnail_url=thumbnail,
+                    )
+                except Exception as pub_e:
+                    logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
         except Exception as persist_e:
             logger.warning("Trip update persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
         
@@ -398,6 +439,81 @@ async def validate_trip_request(request: TripPlanRequest):
     except Exception as e:
         logger.error(f"Error validating request: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Helpers ---
+def _compute_public_metadata(itinerary: Dict[str, Any]) -> tuple[str, str, str]:
+    """Derive a public-facing title, summary and thumbnail from the itinerary JSON.
+    - title: "<Destination>: <trip_duration_days>-day <travel_style> itinerary"
+    - summary: first 2 daily themes or a concise description with group size and budget
+    - thumbnail: first available photo URL from accommodations.primary or top attraction/photography_spots
+    """
+    try:
+        dest = itinerary.get("destination") or "Trip"
+        days = itinerary.get("trip_duration_days") or len(itinerary.get("daily_itineraries", []) or [])
+        style = itinerary.get("travel_style") or "travel"
+        title = f"{dest}: {days}-day {style} itinerary"
+
+        # Build a brief summary
+        themes = []
+        for d in (itinerary.get("daily_itineraries") or [])[:2]:
+            t = d.get("theme") if isinstance(d, dict) else None
+            if t:
+                themes.append(t)
+        if themes:
+            summary = "; ".join(themes)
+        else:
+            group = itinerary.get("group_size")
+            budget = itinerary.get("total_budget")
+            currency = itinerary.get("currency")
+            summary = f"Plan for {group} travelers. Budget: {budget} {currency}."
+
+        # Choose thumbnail
+        def first_photo_from_place(p: Any) -> str | None:
+            try:
+                photos = None
+                if isinstance(p, dict):
+                    photos = p.get("photos")
+                elif hasattr(p, "get"):
+                    photos = p.get("photos")
+                if isinstance(photos, list) and photos:
+                    return str(photos[0])
+            except Exception:
+                return None
+            return None
+
+        thumb = None
+        acc = (itinerary.get("accommodations") or {}).get("primary_recommendation") if isinstance(itinerary.get("accommodations"), dict) else None
+        if acc:
+            thumb = first_photo_from_place(acc)
+        if not thumb:
+            # Try photography_spots, then first attraction from day 1 morning/afternoon/evening
+            spots = itinerary.get("photography_spots") or []
+            for s in spots:
+                thumb = first_photo_from_place(s)
+                if thumb:
+                    break
+        if not thumb:
+            days_list = itinerary.get("daily_itineraries") or []
+            if days_list:
+                first_day = days_list[0] or {}
+                for slot in ["morning", "afternoon", "evening"]:
+                    block = first_day.get(slot) or {}
+                    for key in ["activities", "meals"]:
+                        items = block.get(key) or []
+                        for it in items:
+                            # activity or meal shape
+                            place = it.get("activity") or (it.get("restaurant") if isinstance(it, dict) else None)
+                            thumb = first_photo_from_place(place or {})
+                            if thumb:
+                                break
+                        if thumb:
+                            break
+                    if thumb:
+                        break
+
+        return title, summary, (thumb or "")
+    except Exception:
+        return ("Trip Itinerary", "A memorable trip.", "")
 
 @app.get("/api/v1/places/search")
 async def search_places(
