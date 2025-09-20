@@ -17,7 +17,6 @@ from src.services.google_places_service import GooglePlacesService
 from src.services.itinerary_generator import ItineraryGeneratorService
 from src.services.maps_service import MapsService
 from src.services.travel_service import TravelService
-from src.utils.database import DatabaseManager
 from src.utils.config import get_settings, validate_settings
 from src.utils.validators import TripRequestValidator
 from src.utils.formatters import ResponseFormatter
@@ -59,13 +58,12 @@ places_service: GooglePlacesService = None
 maps_service: MapsService = None
 travel_service: TravelService = None
 itinerary_generator: ItineraryGeneratorService = None
-db_manager: DatabaseManager = None
 fs_manager: FirestoreManager = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, db_manager, fs_manager
+    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager
     
     try:
         settings = get_settings()
@@ -94,7 +92,6 @@ async def startup_event():
         travel_service = TravelService()
         
         itinerary_generator = ItineraryGeneratorService(vertex_ai_service, places_service, travel_service)
-        db_manager = DatabaseManager()
         # Initialize Firestore if enabled
         if settings.USE_FIRESTORE:
             try:
@@ -111,11 +108,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on shutdown"""
-    global db_manager
-    
-    if db_manager:
-        db_manager.close()
-        logger.info("Database connections closed")
+    # No SQL resources to close
+    return
 
 # Dependency to get services
 def get_services():
@@ -125,7 +119,6 @@ def get_services():
         'maps': maps_service,
         'travel': travel_service,
         'itinerary_generator': itinerary_generator,
-        'db': db_manager,
         'fs': fs_manager
     }
 
@@ -304,16 +297,8 @@ async def get_trip_plan(trip_id: str):
                     raise HTTPException(status_code=404, detail="Trip plan not found")
                 return TripPlanResponse(**response_data)
 
-        # Fallback to SQL DB if Firestore not used or not found
-        trip_plan = await db_manager.get_trip_plan(trip_id)
-        if not trip_plan:
-            raise HTTPException(status_code=404, detail="Trip plan not found")
-        
-        # Convert database response to TripPlanResponse model
-        response_data = trip_plan['response_data']
-        trip_response = TripPlanResponse(**response_data)
-        
-        return trip_response
+        # No SQL fallback; if Firestore not used or not found, return 404
+        raise HTTPException(status_code=404, detail="Trip plan not found")
         
     except HTTPException:
         raise
@@ -347,9 +332,6 @@ async def regenerate_trip_plan(
         if settings.USE_FIRESTORE and fs_manager is not None:
             doc = await fs_manager.get_trip_plan(trip_id)
             exists = doc is not None
-        else:
-            existing_trip = await db_manager.get_trip_plan(trip_id)
-            exists = existing_trip is not None
         if not exists:
             raise HTTPException(status_code=404, detail="Trip plan not found")
         
@@ -386,11 +368,6 @@ async def delete_trip_plan(trip_id: str):
         success = False
         if settings.USE_FIRESTORE and fs_manager is not None:
             success = await fs_manager.delete_trip_plan(trip_id)
-            if not success:
-                # Try SQL fallback
-                success = await db_manager.delete_trip_plan(trip_id)
-        else:
-            success = await db_manager.delete_trip_plan(trip_id)
         if not success:
             raise HTTPException(status_code=404, detail="Trip plan not found")
         
@@ -468,14 +445,34 @@ async def search_places(
 async def get_statistics():
     """Get trip planning statistics"""
     try:
-        stats = await db_manager.get_trip_statistics()
-        
-        # Add additional statistics
-        stats['api_version'] = get_settings().API_VERSION
-        stats['service_status'] = "operational"
-        
+        stats = {
+            "total_trips": 0,
+            "recent_trips": [],
+            "api_version": get_settings().API_VERSION,
+            "service_status": "operational",
+        }
+        settings = get_settings()
+        if settings.USE_FIRESTORE and fs_manager is not None:
+            col = fs_manager.client.collection(fs_manager.collection_name)
+            # Total trips (lightweight attempt; for large datasets, consider counters)
+            try:
+                total = 0
+                for _ in col.limit(1000).stream():
+                    total += 1
+                stats["total_trips"] = total
+            except Exception as e_count:
+                logger.warning("Failed to compute total_trips", extra={"error": str(e_count)})
+            # Recent trips by updatedAt desc (if field exists)
+            try:
+                recent_query = col.order_by("updatedAt", direction="DESCENDING").limit(5)
+                recent_docs = list(recent_query.stream())
+                stats["recent_trips"] = [
+                    {"id": d.id, **({"status": d.to_dict().get("status")} if d.to_dict() else {})}
+                    for d in recent_docs
+                ]
+            except Exception as e_recent:
+                logger.warning("Failed to fetch recent_trips", extra={"error": str(e_recent)})
         return stats
-        
     except Exception as e:
         logger.error(f"Error getting statistics: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -489,8 +486,7 @@ async def health_check():
             vertex_ai_service is not None,
             places_service is not None,
             maps_service is not None,
-            itinerary_generator is not None,
-            db_manager is not None
+            itinerary_generator is not None
         ])
         
         return {
@@ -500,8 +496,7 @@ async def health_check():
                 "vertex_ai": vertex_ai_service is not None,
                 "google_places": places_service is not None,
                 "maps": maps_service is not None,
-                "itinerary_generator": itinerary_generator is not None,
-                "database": db_manager is not None
+                "itinerary_generator": itinerary_generator is not None
             },
             "version": get_settings().API_VERSION
         }

@@ -23,7 +23,7 @@ trip-planner-agent/
 │   │   ├── request_models.py      # Input validation models
 │   │   ├── response_models.py     # Output structure models
 │   │   ├── place_models.py        # Google Places data models
-│   │   └── database_models.py     # Database schema models
+│   │   └── (Firestore only; SQL models removed)
 │   ├── services/
 │   │   ├── vertex_ai_service.py   # Google Vertex AI integration
 │   │   ├── google_places_service.py # Google Places API service
@@ -33,7 +33,7 @@ trip-planner-agent/
 │   │   ├── validators.py          # Input validation utilities
 │   │   ├── formatters.py          # Response formatting utilities
 │   │   ├── config.py              # Configuration management
-│   │   └── database.py            # Database operations
+│   │   └── firestore_manager.py   # Firestore persistence utilities
 │   ├── api/
 │   │   └── main.py                # FastAPI application
 │   └── prompts/
@@ -171,7 +171,7 @@ curl -X POST "http://localhost:8000/api/v1/validate-request" \
 |----------|-------------|---------|
 | `GOOGLE_CLOUD_LOCATION` | Vertex AI region | `us-central1` |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service account key file | Use `gcloud auth` instead |
-| `DATABASE_URL` | Database connection string | `sqlite:///./trip_planner.db` |
+| `DATABASE_URL` | Database connection string | (Removed; Firestore only) |
 | `DEBUG_MODE` | Enable debug mode | `false` |
 | `API_PORT` | API server port | `8000` |
 | `USE_FIRESTORE` | Enable Firestore persistence | `true` |

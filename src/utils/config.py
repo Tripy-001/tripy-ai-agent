@@ -14,8 +14,7 @@ class Settings(BaseSettings):
     USE_FIRESTORE: bool = True
     FIRESTORE_TRIPS_COLLECTION: str = "trips"
     
-    # Database Configuration
-    DATABASE_URL: str = "sqlite:///./trip_planner.db"
+    # Database Configuration (SQL removed)
     
     # API Configuration
     API_VERSION: str = "1.0.0"
