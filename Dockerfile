@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ ./src/
-COPY .env.example .env.example
+COPY .env .env
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash app \
