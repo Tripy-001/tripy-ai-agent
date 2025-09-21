@@ -24,7 +24,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ ./src/
-COPY .env .env
+
+# Copy .env file if it exists (optional)
+COPY .env* ./
+
+# Copy credential files if they exist
+COPY gcp-config.json* ./
+COPY firebase-config.json* ./
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash app \
