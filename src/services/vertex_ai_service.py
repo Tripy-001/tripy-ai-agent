@@ -30,7 +30,26 @@ class VertexAIService:
         try:
             self.logger.debug("[vertex] generate_trip_plan called")
             system_prompt = self._build_system_prompt()
-            user_prompt = self._build_user_prompt(request, places_data)
+            # Prepare and log final compact places sent to model
+            compact_places_raw = self._compact_places_data(places_data)
+            compact_places = self._cap_compact_places_for_prompt(compact_places_raw)
+            try:
+                compact_json = json.dumps(compact_places, ensure_ascii=False, separators=(",", ":"))
+                counts = {k: (len(v) if isinstance(v, list) else 0) for k, v in compact_places.items() if isinstance(v, list)}
+                self.logger.info(
+                    "[vertex] compact places summary",
+                    extra={
+                        "chars": len(compact_json),
+                        "categories": list(compact_places.keys()),
+                        "counts": counts,
+                    }
+                )
+                # Full compact JSON at debug
+                self.logger.debug("[vertex] compact places JSON\n%s", json.dumps(compact_places, ensure_ascii=False, indent=2))
+            except Exception as _e:
+                self.logger.debug("[vertex] failed to serialize compact places", extra={"error": str(_e)})
+
+            user_prompt = self._build_user_prompt(request, places_data, compact_places=compact_places)
             # Prompt diagnostics (sizes only)
             self.logger.debug(
                 "[vertex] prompt sizes",
@@ -43,6 +62,8 @@ class VertexAIService:
                     "activity": str(request.activity_level)
                 }
             )
+            # Full user prompt at debug for inspection
+            self.logger.debug("[vertex] user prompt\n%s", user_prompt)
             
             # Generate content using Gemini Flash
             response = self.model.generate_content(
@@ -51,7 +72,9 @@ class VertexAIService:
                     "temperature": 0.7,
                     # "top_p": 0.8,
                     # "top_k": 40,
-                    "response_mime_type": "application/json"
+                    "response_mime_type": "application/json",
+                    # Do not force max_output_tokens; allow model to choose suitable budget
+                    "candidate_count": 1
                 }
             )       
             self.logger.debug("[vertex] raw response object received")
@@ -188,7 +211,6 @@ class VertexAIService:
                                             "opening_hours": "object|null",
                                             "website": "string|null",
                                             "phone": "string|null",
-                                            "photos": ["string"],
                                             "description": "string|null",
                                             "why_recommended": "string",
                                             "booking_required": "boolean",
@@ -257,8 +279,14 @@ class VertexAIService:
                     "map_data": {
                         "static_map_url": "string",
                         "interactive_map_embed_url": "string",
-                        "all_locations": ["object"],
-                        "daily_route_maps": { "string": "string" },
+                        "all_locations": [
+                            {
+                                "place_id": "string (from provided places_data)",
+                                "name": "string",
+                                "coordinates": { "lat": "number", "lng": "number" }
+                            }
+                        ],
+                        "daily_route_maps": { "Day 1": "https://...", "Day 2": "https://..." },
                         "walking_distances": { "string": { "string": "number" } }
                     },
 
@@ -308,6 +336,9 @@ class VertexAIService:
                 INSTRUCTIONS:
                                                                 - YOUR MOST IMPORTANT RULE: You MUST ONLY use places and their real `place_id` values from the provided `places_data`. NEVER invent, simulate, or create a placeholder `place_id` (e.g., 'simulated_restaurant_1', 'generic_place'). Every single activity in the itinerary must map to a real entry in the provided `places_data`. Failure to do so will result in an invalid response.
                                                                 - Use ONLY the provided place data (places_data) and their real place_id values. Do not invent place_ids. Never output placeholders like "generic_*" or activities without a valid place_id and coordinates.
+                                                                - Do not include any photo fields. Photos are not part of the schema.
+                                                                - Keep strings concise: descriptions and why_recommended should be under 200 characters each.
+                                                                - Alternatives per day: provide at most 2 attractions and at most 2 meals in `alternative_options`.
                                                                 - Daily activities must be concise and PLACE-ONLY:
                                                                     - Include only real places such as tourist attractions, viewpoints, museums, cultural centers, gardens/parks, markets/shops, restaurants, or cafes.
                                                                     - Do NOT include transport or accommodation as activities. Travel and hotel check-in/out should be reflected in descriptions/notes, not as separate activities.
@@ -322,8 +353,8 @@ class VertexAIService:
                                                                     - Use must_try_cuisines and dietary_restrictions to diversify meal choices across days; mention signature dishes in why_recommended when relevant.
                                                                 - Represent meals (breakfast, lunch, dinner) as activities within the appropriate blocks, using restaurants or cafes from places_data with real place_ids. Use activity_type="meal" and estimate costs per person in the specified currency. Include rating and user_ratings_total in PlaceResponse when available.
                                                                 - Provide structured daily alternatives:
-                                                                    - alternative_options.attractions: 2–4 additional sights for the day, full PlaceResponse, each with why_recommended.
-                                                                    - alternative_options.meals: 2–4 additional restaurants/cafes suitable for that day’s meals, full PlaceResponse with cuisine angle in description/why_recommended.
+                                                                    - alternative_options.attractions: up to 2 additional sights for the day, full PlaceResponse, each with why_recommended.
+                                                                    - alternative_options.meals: up to 2 additional restaurants/cafes suitable for that day’s meals, full PlaceResponse with cuisine angle in description/why_recommended.
                                                                 - Include realistic, destination-appropriate price estimates in the specified currency.
                                                                 - For each primary activity, prefer 1–2 alternatives drawn from provided data when possible.
                                                                 - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation, accommodations, and the travel_options array.
@@ -339,12 +370,24 @@ class VertexAIService:
                                                                     - Align Day 1 morning to begin post-arrival window; avoid scheduling activities before a late arrival.
                                                                     - On the last day, include realistic wrap-up activities only if time permits before departure.
                                                                 - Where an object is required (e.g., transportation sections), do NOT return plain strings; if you only have descriptive text, wrap it in an object under a "notes" field.
+                                                                - Map data formatting (STRICT):
+                                                                    - "map_data.all_locations" MUST be an array of objects and each object MUST contain exactly these fields: "place_id" (must be a real id from places_data), "name", and "coordinates" with numeric "lat" and "lng". Do not add extra fields in these objects.
+                                                                    - "map_data.static_map_url" MUST be a single HTTPS Google Maps URL that shows ONLY the destination center (no directions). If API-key parameters are unknown, use a valid public format like "https://www.google.com/maps/search/?api=1&query={lat},{lng}" using the destination’s coordinates. Do not leave this empty or as a placeholder.
+                                                                    - "map_data.interactive_map_embed_url" MUST be a single HTTPS Google Maps embed or maps URL focused on the destination center (no directions), such as "https://www.google.com/maps?q={lat},{lng}" or an embed form. Do not leave this empty or as a placeholder.
+                                                                    - These two URLs are destination-level only (overview maps). Do not put daily route directions here; daily routes belong in "map_data.daily_route_maps".
+                                                                    - "map_data.daily_route_maps" MUST include an entry for EVERY day in daily_itineraries with key "Day {day_number}".
+                                                                    - Each value MUST be a single HTTPS URL (matching ^https://) to a route map that sequences ALL locations visited that day in order (morning → afternoon → evening; include meal stops). Never output placeholders like "Day 1 map", "[route]", or descriptive text without a URL.
+                                                                    - Build the route using ONLY places from places_data and their coordinates. If fewer than 2 locations with coordinates exist on a day, return a valid static map URL showing the available point(s) rather than a placeholder.
                                                                 - Respond with valid JSON only, no extra text.
                 """
     
-    def _build_user_prompt(self, request: TripPlanRequest, places_data: Dict[str, Any]) -> str:
+    def _build_user_prompt(self, request: TripPlanRequest, places_data: Dict[str, Any], *, compact_places: Optional[Dict[str, Any]] = None) -> str:
         trip_duration = (request.end_date - request.start_date).days
-        
+        # Use provided compact places if available; otherwise compute locally
+        if compact_places is None:
+            compact_places = self._compact_places_data(places_data)
+            compact_places = self._cap_compact_places_for_prompt(compact_places)
+
         return f"""
         Create a comprehensive trip plan with the following requirements:
         
@@ -373,8 +416,8 @@ class VertexAIService:
         - Previous visits: {request.previous_visits}
         - Language preferences: {request.language_preferences}
         
-        AVAILABLE PLACES DATA:
-        {json.dumps(places_data, indent=2)}
+        AVAILABLE PLACES DATA (COMPACT):
+        {json.dumps(compact_places, indent=2)}
         
         Generate a complete trip plan following the TripPlanResponse schema exactly.
         - Keep daily activities concise and place-only (1–2 real places per time block). No transport or accommodation as activities.
@@ -383,9 +426,107 @@ class VertexAIService:
         - Use only the place_ids provided in the places_data – do not make up any place IDs; never output placeholders like generic_*.
         - Create a logical daily flow that considers travel time between locations; put connective logic in each activity's description.
         - Include practical tips, local customs, and cultural insights for {request.destination}.
-    - Emphasize a rhythmic daily flow—breakfast → explore → lunch → explore → evening wind-down → dinner—with meals chosen from places_data, favoring high ratings and strong review counts; vary cuisines using must_try_cuisines and don’t repeat restaurants.
-    - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary, including all alternatives, is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
+        - Emphasize a rhythmic daily flow—breakfast → explore → lunch → explore → evening wind-down → dinner—with meals chosen from places_data, favoring high ratings and strong review counts; vary cuisines using must_try_cuisines and don’t repeat restaurants.
+        - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary, including all alternatives, is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
         """
+
+    def _compact_places_data(self, places_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a compact version of places_data for prompting:
+        - Drop photos and other heavy fields
+        - Keep only essential attributes the model needs to select real places
+        - Limit count per category
+        """
+        try:
+            if not isinstance(places_data, dict):
+                return {}
+            limits = {
+                "restaurants": 20,
+                "attractions": 30,
+                "accommodations": 15,
+                "shopping": 10,
+                "nightlife": 8,
+                "cultural_sites": 12,
+                "outdoor_activities": 12,
+                "transportation_hubs": 8,
+                "must_visit": 12
+            }
+            keep_keys = {"place_id", "id", "name", "displayName", "formattedAddress", "address", "location", "coordinates", "rating", "user_ratings_total", "userRatingCount", "price_level", "priceLevel", "types", "websiteUri", "website", "internationalPhoneNumber", "phone"}
+
+            def _map_place(p: Dict[str, Any]) -> Dict[str, Any]:
+                if not isinstance(p, dict):
+                    return {}
+                # Normalize common fields to our expected names; no photos
+                out: Dict[str, Any] = {
+                    "place_id": p.get("place_id") or p.get("id"),
+                    "name": p.get("name") or ((p.get("displayName") or {}).get("text") if isinstance(p.get("displayName"), dict) else None),
+                    "address": p.get("address") or p.get("formattedAddress"),
+                    "coordinates": p.get("coordinates") or ({
+                        "lat": (p.get("location") or {}).get("latitude"),
+                        "lng": (p.get("location") or {}).get("longitude")
+                    } if isinstance(p.get("location"), dict) else None),
+                    "rating": p.get("rating"),
+                    "user_ratings_total": p.get("user_ratings_total") or p.get("userRatingCount"),
+                    "price_level": p.get("price_level") or p.get("priceLevel"),
+                    "types": p.get("types"),
+                }
+                # remove Nones
+                return {k: v for k, v in out.items() if v is not None}
+
+            compact: Dict[str, Any] = {}
+            for cat, arr in places_data.items():
+                if not isinstance(arr, list):
+                    continue
+                limit = limits.get(cat, 12)
+                trimmed = []
+                for p in arr[:limit]:
+                    mp = _map_place(p)
+                    if mp.get("place_id") and (mp.get("coordinates") or {}).get("lat") is not None:
+                        trimmed.append(mp)
+                if trimmed:
+                    compact[cat] = trimmed
+            # Include travel options list if present but trimmed
+            if isinstance(places_data.get("travel_to_destination"), list):
+                compact["travel_to_destination"] = places_data["travel_to_destination"][:3]
+            return compact
+        except Exception:
+            return {}
+
+    def _cap_compact_places_for_prompt(self, compact_places: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply a strict size budget to compact_places to avoid overlong prompts.
+        - Drop any place entry exceeding MAX_PLACE_ENTRY_CHARS
+        - Stop adding entries when total JSON length reaches MAX_PROMPT_PLACES_CHARS
+        """
+        try:
+            from src.utils.config import get_settings
+            s = get_settings()
+            max_places_chars = int(getattr(s, "MAX_PROMPT_PLACES_CHARS", 20000))
+            max_entry_chars = int(getattr(s, "MAX_PLACE_ENTRY_CHARS", 700))
+            if not isinstance(compact_places, dict):
+                return {}
+            out: Dict[str, Any] = {}
+            total = 0
+            for cat, arr in compact_places.items():
+                if not isinstance(arr, list) or not arr:
+                    continue
+                new_arr = []
+                for p in arr:
+                    try:
+                        js = json.dumps(p, separators=(",", ":"))
+                    except Exception:
+                        continue
+                    if len(js) > max_entry_chars:
+                        continue
+                    if total + len(js) > max_places_chars:
+                        break
+                    new_arr.append(p)
+                    total += len(js)
+                if new_arr:
+                    out[cat] = new_arr
+                if total >= max_places_chars:
+                    break
+            return out
+        except Exception:
+            return compact_places
 
     def _extract_response_text(self, response: Any) -> Optional[str]:
         """Extract text from Vertex AI response, handling candidates and multi-part content."""
@@ -682,3 +823,34 @@ class VertexAIService:
             "data_freshness_score": 0.0,
             "confidence_score": 0.0
         }
+
+    # --- Lightweight helper for JSON generation tasks (e.g., public trip metadata) ---
+    def generate_json_from_prompt(self, prompt: str, temperature: float = 0.4) -> str:
+        """Generate a JSON string response for a given prompt using the same model.
+        Returns raw text; caller should parse JSON and handle exceptions.
+        """
+        try:
+            response = self.model.generate_content(
+                [prompt],
+                generation_config={
+                    "temperature": temperature,
+                    "response_mime_type": "application/json",
+                    "candidate_count": 1,
+                }
+            )
+            # Try to extract text content
+            text_attr = getattr(response, "text", None)
+            if isinstance(text_attr, str) and text_attr.strip():
+                return text_attr
+            # Fallback to concatenating parts
+            parts_text: list[str] = []
+            for cand in getattr(response, "candidates", []) or []:
+                content = getattr(cand, "content", None)
+                for part in getattr(content, "parts", []) or []:
+                    t = getattr(part, "text", None)
+                    if t:
+                        parts_text.append(t)
+            return "\n".join(parts_text).strip()
+        except Exception as e:
+            self.logger.error(f"[vertex] generate_json_from_prompt failed: {e}")
+            return "{}"

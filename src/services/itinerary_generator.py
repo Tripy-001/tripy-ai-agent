@@ -7,6 +7,7 @@ from src.models.response_models import TripPlanResponse
 from src.services.vertex_ai_service import VertexAIService
 from src.services.google_places_service import GooglePlacesService
 from src.services.travel_service import TravelService
+import json
 
 class ItineraryGeneratorService:
     def __init__(self, vertex_ai_service: VertexAIService, places_service: GooglePlacesService, travel_service: TravelService | None = None):
@@ -101,11 +102,15 @@ class ItineraryGeneratorService:
             except Exception:
                 pass
 
-            # Step 6: Validate and create response model directly against TripPlanResponse
+            # Step 6: (removed) No photo fields to sanitize
+
+            # Step 7: Validate and create response model directly against TripPlanResponse
             try:
                 # Minimal sanitation to handle common minor shape mismatches
                 if isinstance(trip_data, dict):
                     trip_data = self._sanitize_trip_data(trip_data)
+                    # Ensure daily_route_maps has valid HTTPS URLs for every day
+                    trip_data = self._ensure_daily_route_maps(trip_data)
                 trip_response = TripPlanResponse(**trip_data)
                 self.logger.info(
                     "[itinerary] Trip plan validated and created",
@@ -126,6 +131,37 @@ class ItineraryGeneratorService:
         except Exception as e:
             self.logger.error("[itinerary] Error during generation", extra={"error": str(e)})
             return self._create_minimal_response(request, trip_id, str(e))
+
+    # --- Public trips: save without photos (photos removed from schema) ---
+    async def create_and_save_public_trip(self, trip_response: TripPlanResponse, request: TripPlanRequest, fs_manager, *, title: str | None = None, summary: str | None = None) -> None:
+        try:
+            self.logger.info(f"[public_trip] Starting generation for trip ID: {trip_response.trip_id}")
+            # Build a simple title/summary; no thumbnail selection since photos are removed
+            out_title = title or f"{trip_response.destination}: {trip_response.trip_duration_days}-day {getattr(trip_response, 'travel_style', '')} itinerary".strip()
+            out_summary = summary or "A memorable trip."
+            # Choose a representative place_id as the thumbnail reference (best shows the destination)
+            try:
+                selected_place_id = self._select_representative_place_id(trip_response)
+            except Exception as sel_err:
+                self.logger.warning("[public_trip] Thumbnail selection failed", extra={"error": str(sel_err)})
+                selected_place_id = None
+
+            try:
+                await fs_manager.save_public_trip(
+                    trip_id=trip_response.trip_id,
+                    request_data=request.model_dump(mode="json"),
+                    itinerary_data=trip_response.model_dump(mode="json"),
+                    title=out_title,
+                    summary=out_summary,
+                    thumbnail_photo_reference=selected_place_id,
+                )
+                self.logger.info("[public_trip] Successfully created/updated public trip", extra={"trip_id": trip_response.trip_id})
+            except Exception as fe:
+                self.logger.warning("[public_trip] Save failed", extra={"error": str(fe)})
+        except Exception as e:
+            self.logger.warning("[public_trip] Generation skipped due to error", extra={"error": str(e)})
+
+    # (photo sanitization removed)
 
     def _sanitize_trip_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Coerce a few common fields into expected shapes without transforming semantics."""
@@ -179,9 +215,9 @@ class ItineraryGeneratorService:
                 place.setdefault("opening_hours", None)
                 place.setdefault("website", None)
                 place.setdefault("phone", None)
-                photos = place.get("photos")
-                if not isinstance(photos, list):
-                    place["photos"] = []
+                # photos removed from schema; ensure none are added
+                if "photos" in place:
+                    place.pop("photos", None)
                 if not place.get("why_recommended"):
                     place["why_recommended"] = f"Recommended option for {context}."
                 if "booking_required" not in place:
@@ -230,7 +266,6 @@ class ItineraryGeneratorService:
                         "opening_hours": b.get("opening_hours"),
                         "website": b.get("website"),
                         "phone": b.get("phone"),
-                        "photos": b.get("photos", []),
                         "description": place.get("description") or ("Meal at a recommended spot" if target_type == "meal" else "Visit a popular local place"),
                         "why_recommended": place.get("why_recommended") or ("Highly rated and popular with travelers"),
                         "booking_required": place.get("booking_required", False),
@@ -352,6 +387,101 @@ class ItineraryGeneratorService:
         except Exception:
             return data
 
+    def _ensure_daily_route_maps(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure map_data.daily_route_maps contains a valid HTTPS route URL for each day.
+        Builds a Google Maps Directions URL from the day's activities (morning -> afternoon -> evening),
+        including meal stops, in chronological order. If only one coordinate is available, creates a
+        Google Maps search URL for that point.
+        """
+        try:
+            if not isinstance(data, dict):
+                return data
+            itins = data.get("daily_itineraries")
+            if not isinstance(itins, list) or not itins:
+                return data
+
+            # Ensure map_data shell
+            md = data.get("map_data")
+            if not isinstance(md, dict):
+                md = {
+                    "static_map_url": "",
+                    "interactive_map_embed_url": "",
+                    "all_locations": [],
+                    "daily_route_maps": {},
+                    "walking_distances": {}
+                }
+                data["map_data"] = md
+            drm = md.get("daily_route_maps")
+            if not isinstance(drm, dict):
+                drm = {}
+                md["daily_route_maps"] = drm
+
+            def fmt_point(lat: Any, lng: Any) -> Optional[str]:
+                try:
+                    return f"{float(lat):.6f},{float(lng):.6f}"
+                except Exception:
+                    return None
+
+            def is_https_url(s: Any) -> bool:
+                return isinstance(s, str) and s.lower().startswith("https://")
+
+            for day in itins:
+                if not isinstance(day, dict):
+                    continue
+                day_num = day.get("day_number") or 0
+                key = f"Day {day_num}" if day_num else None
+                # Collect coordinates in chronological order
+                points: List[str] = []
+                for slot in ("morning", "afternoon", "evening"):
+                    blk = day.get(slot) or {}
+                    acts = blk.get("activities") or []
+                    if isinstance(acts, list):
+                        for act in acts:
+                            if not isinstance(act, dict):
+                                continue
+                            place = act.get("activity") or {}
+                            coords = place.get("coordinates") or {}
+                            lat = coords.get("lat")
+                            lng = coords.get("lng")
+                            p = fmt_point(lat, lng)
+                            if p:
+                                # Avoid consecutive duplicates
+                                if not points or points[-1] != p:
+                                    points.append(p)
+
+                if not key:
+                    continue
+
+                url: Optional[str] = None
+                if len(points) >= 2:
+                    origin = points[0]
+                    destination = points[-1]
+                    waypoints = "|".join(points[1:-1]) if len(points) > 2 else ""
+                    if waypoints:
+                        url = (
+                            f"https://www.google.com/maps/dir/?api=1&travelmode=driving"
+                            f"&origin={origin}&destination={destination}&waypoints={waypoints}"
+                        )
+                    else:
+                        url = (
+                            f"https://www.google.com/maps/dir/?api=1&travelmode=driving"
+                            f"&origin={origin}&destination={destination}"
+                        )
+                elif len(points) == 1:
+                    url = f"https://www.google.com/maps/search/?api=1&query={points[0]}"
+
+                # Replace if missing or placeholder (non-HTTPS), otherwise keep model-provided URL
+                existing = drm.get(key)
+                if is_https_url(existing):
+                    # Keep existing valid URL
+                    continue
+                if url:
+                    drm[key] = url
+
+            return data
+        except Exception:
+            return data
+
     def _enforce_accommodation_from_candidates(self, trip_data: Dict[str, Any], candidates: List[Dict[str, Any]], request: TripPlanRequest) -> Dict[str, Any]:
         """Ensure the accommodations.primary_recommendation comes from real fetched candidates.
         If AI invents a placeholder or unknown place_id, replace it with the best-scored candidate.
@@ -414,7 +544,6 @@ class ItineraryGeneratorService:
             "opening_hours": best_cand.get("opening_hours"),
             "website": best_cand.get("website"),
             "phone": best_cand.get("phone"),
-            "photos": best_cand.get("photos", []),
             "category": preserved_category,
             "subcategory": preserved_subcat,
             "description": preserved_desc,
@@ -504,3 +633,116 @@ class ItineraryGeneratorService:
             data_freshness_score=0.0,
             confidence_score=0.0
         )
+
+    def _select_representative_place_id(self, trip: TripPlanResponse) -> Optional[str]:
+        """Select a place_id that best represents the destination, based on itinerary places.
+        Heuristic:
+        - Prefer attractions/landmarks/cultural sites over restaurants/accommodations.
+        - Use rating and user_ratings_total to rank prominence.
+        - Slight bonus if the destination name appears in the place name.
+        - Consider places from all daily activities, photography_spots, hidden_gems, and primary accommodation as fallback.
+        Returns the best place_id or None.
+        """
+        try:
+            candidates: Dict[str, Dict[str, Any]] = {}
+
+            def add_candidate(place_like: Any):
+                try:
+                    if not place_like:
+                        return
+                    if isinstance(place_like, dict):
+                        pid = place_like.get("place_id")
+                        name = place_like.get("name")
+                        cat = (place_like.get("category") or "").lower()
+                        sub = (place_like.get("subcategory") or "").lower() if place_like.get("subcategory") else ""
+                        rating = place_like.get("rating")
+                        urt = place_like.get("user_ratings_total")
+                    else:
+                        pid = getattr(place_like, "place_id", None)
+                        name = getattr(place_like, "name", None)
+                        cat = str(getattr(place_like, "category", "") or "").lower()
+                        sub = str(getattr(place_like, "subcategory", "") or "").lower()
+                        rating = getattr(place_like, "rating", None)
+                        urt = getattr(place_like, "user_ratings_total", None)
+                    if not isinstance(pid, str) or not pid:
+                        return
+                    if pid in candidates:
+                        return
+                    candidates[pid] = {
+                        "place_id": pid,
+                        "name": name or "",
+                        "category": cat,
+                        "subcategory": sub,
+                        "rating": float(rating) if isinstance(rating, (int, float)) else 0.0,
+                        "user_ratings_total": int(urt) if isinstance(urt, (int, float)) else 0,
+                    }
+                except Exception:
+                    return
+
+            # 1) Activities across all days
+            for day in (trip.daily_itineraries or []):
+                for slot_name in ("morning", "afternoon", "evening"):
+                    blk = getattr(day, slot_name, None) or {}
+                    acts = blk.get("activities") if isinstance(blk, dict) else getattr(blk, "activities", [])
+                    if isinstance(acts, list):
+                        for item in acts:
+                            place = item.get("activity") if isinstance(item, dict) else getattr(item, "activity", None)
+                            add_candidate(place)
+
+            # 2) Spots and gems
+            for pl in (getattr(trip, "photography_spots", None) or []):
+                add_candidate(pl)
+            for pl in (getattr(trip, "hidden_gems", None) or []):
+                add_candidate(pl)
+
+            # 3) Primary accommodation (fallback)
+            try:
+                acc = getattr(trip, "accommodations", None)
+                if acc is not None:
+                    add_candidate(getattr(acc, "primary_recommendation", None))
+            except Exception:
+                pass
+
+            if not candidates:
+                return None
+
+            dest = (getattr(trip, "destination", "") or "").lower()
+
+            def score(c: Dict[str, Any]) -> float:
+                s = 0.0
+                cat = c.get("category", "")
+                sub = c.get("subcategory", "")
+                # Category weights
+                if "attraction" in cat or "tourist_attraction" in sub or "landmark" in sub:
+                    s += 200
+                elif "cultural" in cat or "museum" in sub:
+                    s += 150
+                elif "outdoor" in cat or sub in ("park", "zoo", "aquarium"):
+                    s += 120
+                elif "shopping" in cat:
+                    s += 60
+                elif "restaurant" in cat or "cafe" in sub or "bar" in sub:
+                    s += 40
+                elif "accommodation" in cat or sub == "lodging":
+                    s += 30
+                else:
+                    s += 10
+
+                # Popularity
+                s += (c.get("rating", 0.0) or 0.0) * 100.0
+                s += min(c.get("user_ratings_total", 0) or 0, 10000) * 0.03
+
+                # Name contains destination keyword bonus
+                name = (c.get("name") or "").lower()
+                if dest and name and dest in name:
+                    s += 50
+                return s
+
+            best = max(candidates.values(), key=score)
+            self.logger.info(
+                "[public_trip] Selected thumbnail place",
+                extra={"place_id": best.get("place_id"), "name": best.get("name"), "category": best.get("category")}
+            )
+            return best.get("place_id")
+        except Exception:
+            return None

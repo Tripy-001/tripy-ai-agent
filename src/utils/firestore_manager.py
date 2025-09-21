@@ -152,7 +152,7 @@ class FirestoreManager:
         return safe
 
     async def save_public_trip(self, trip_id: str, request_data: Dict[str, Any], itinerary_data: Dict[str, Any],
-                               title: str, summary: str, thumbnail_url: str) -> bool:
+                               title: str, summary: str, thumbnail_photo_reference: str | None) -> bool:
         """Create or update a public copy of a trip for discovery.
 
         Schema:
@@ -171,7 +171,7 @@ class FirestoreManager:
                 "request": self._sanitize_for_firestore(self._scrub_for_public(request_data)),
                 "title": title,
                 "summary": summary,
-                "thumbnail_url": thumbnail_url,
+                "thumbnail_photo_reference": thumbnail_photo_reference or "",
                 "source_trip_id": trip_id,
                 "updated_at": datetime.utcnow().isoformat(),
                 "schema_version": 1,

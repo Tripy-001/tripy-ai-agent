@@ -227,17 +227,9 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP,
                         "createdAt": gcf.SERVER_TIMESTAMP,
                     }, merge=True)
-                    # Also create/update a public copy of the trip (non-blocking)
+                    # Also create/update a public copy of the trip (non-blocking) using AI to pick photo reference
                     try:
-                        title, summary, thumbnail = _compute_public_metadata(response_data)
-                        await fs_manager.save_public_trip(
-                            trip_id=trip_id,
-                            request_data=request_data,
-                            itinerary_data=response_data,
-                            title=title,
-                            summary=summary,
-                            thumbnail_url=thumbnail,
-                        )
+                        await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
                     except Exception as pub_e:
                         logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
             except Exception as persist_e:
@@ -266,17 +258,9 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP
                     })
                     logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
-                    # Save public copy as well (non-blocking)
+                    # Save public copy as well (non-blocking) using AI to select thumbnail reference
                     try:
-                        title, summary, thumbnail = _compute_public_metadata(itinerary_json)
-                        await fs_manager.save_public_trip(
-                            trip_id=trip_id,
-                            request_data=req.model_dump(mode="json"),
-                            itinerary_data=itinerary_json,
-                            title=title,
-                            summary=summary,
-                            thumbnail_url=thumbnail,
-                        )
+                        await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
                     except Exception as pub_e:
                         logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
                 except Exception as ue:
@@ -376,15 +360,7 @@ async def regenerate_trip_plan(
                 )
                 # Update public copy as well (non-blocking)
                 try:
-                    title, summary, thumbnail = _compute_public_metadata(upd_json)
-                    await fs_manager.save_public_trip(
-                        trip_id=trip_id,
-                        request_data=req_json,
-                        itinerary_data=upd_json,
-                        title=title,
-                        summary=summary,
-                        thumbnail_url=thumbnail,
-                    )
+                    await itinerary_generator.create_and_save_public_trip(updated_trip, request, fs_manager)
                 except Exception as pub_e:
                     logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
         except Exception as persist_e:

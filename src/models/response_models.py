@@ -34,7 +34,6 @@ class PlaceResponse(BaseModel):
     opening_hours: Optional[Dict[str, Any]] = None
     website: Optional[str] = None
     phone: Optional[str] = None
-    photos: List[str] = Field(default_factory=list)
     description: Optional[str] = None
     why_recommended: str
     booking_required: bool = Field(default=False)

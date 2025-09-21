@@ -43,8 +43,12 @@ class Settings(BaseSettings):
     
     # Performance Settings
     MAX_PLACES_PER_CATEGORY: int = 10
-    MAX_API_CALLS_PER_REQUEST: int = 200
+    MAX_API_CALLS_PER_REQUEST: int = 30
     REQUEST_TIMEOUT_SECONDS: int = 300
+
+    # Prompt sizing controls
+    MAX_PROMPT_PLACES_CHARS: int = 20000  # budget for compact places JSON in prompt
+    MAX_PLACE_ENTRY_CHARS: int = 700      # skip oversized place entries when compacting
     
     model_config = {"env_file": ".env", "case_sensitive": True}
 
