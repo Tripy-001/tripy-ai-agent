@@ -152,7 +152,8 @@ class FirestoreManager:
         return safe
 
     async def save_public_trip(self, trip_id: str, request_data: Dict[str, Any], itinerary_data: Dict[str, Any],
-                               title: str, summary: str, thumbnail_photo_reference: str | None) -> bool:
+                               title: str, summary: str, thumbnail_photo_reference: str | None,
+                               destination_photos: list[str] | None = None) -> bool:
         """Create or update a public copy of a trip for discovery.
 
         Schema:
@@ -172,6 +173,7 @@ class FirestoreManager:
                 "title": title,
                 "summary": summary,
                 "thumbnail_photo_reference": thumbnail_photo_reference or "",
+                "destination_photos": list(destination_photos or []),
                 "source_trip_id": trip_id,
                 "updated_at": datetime.utcnow().isoformat(),
                 "schema_version": 1,
@@ -185,4 +187,55 @@ class FirestoreManager:
             return True
         except Exception as e:
             self.logger.error(f"Firestore public save failed for {trip_id}: {e}")
+            return False
+
+    # --- Public trips queries/updates ---
+    async def list_public_trips(self, page_size: int = 20, page_token: Optional[str] = None) -> Dict[str, Any]:
+        """List public trips with simple pagination.
+        page_token: use last document ID as a cursor for naive pagination.
+        Returns { items: [...], next_page_token: str | None }
+        """
+        try:
+            col = self._public_collection()
+            try:
+                col = col.order_by("updated_at", direction=firestore.Query.DESCENDING)
+            except Exception as order_err:
+                # Fallback if some docs lack updated_at
+                self.logger.warning(f"order_by(updated_at) failed, falling back to unordered: {order_err}")
+            if page_token:
+                try:
+                    snap = self._public_collection().document(page_token).get()
+                    if snap.exists:
+                        col = col.start_after(snap)
+                except Exception as start_err:
+                    self.logger.warning(f"start_after fallback ignored: {start_err}")
+            docs = list(col.limit(page_size).stream())
+            items = []
+            for d in docs:
+                data = d.to_dict() or {}
+                items.append({"id": d.id, **data})
+            next_token = docs[-1].id if len(docs) == page_size else None
+            return {"items": items, "next_page_token": next_token}
+        except Exception as e:
+            self.logger.error(f"list_public_trips failed: {e}")
+            return {"items": [], "next_page_token": None}
+
+    async def get_public_trip(self, trip_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            snap = self._public_collection().document(trip_id).get()
+            if snap.exists:
+                return snap.to_dict()
+            return None
+        except Exception as e:
+            self.logger.error(f"get_public_trip failed: {e}")
+            return None
+
+    async def update_public_trip(self, trip_id: str, updates: Dict[str, Any]) -> bool:
+        try:
+            updates = self._sanitize_for_firestore(updates)
+            updates["updated_at"] = datetime.utcnow().isoformat()
+            self._public_collection().document(trip_id).set(updates, merge=True)
+            return True
+        except Exception as e:
+            self.logger.error(f"update_public_trip failed: {e}")
             return False

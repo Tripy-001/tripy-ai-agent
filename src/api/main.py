@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Optional
 from pydantic import BaseModel
 from google.cloud import firestore as gcf
 
@@ -227,11 +227,12 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP,
                         "createdAt": gcf.SERVER_TIMESTAMP,
                     }, merge=True)
-                    # Also create/update a public copy of the trip (non-blocking) using AI to pick photo reference
+                    # Also create/update a public copy of the trip (non-blocking)
                     try:
                         await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
+                        await _enrich_public_trip(trip_response, req)
                     except Exception as pub_e:
-                        logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
+                        logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
             except Exception as persist_e:
                 logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
             return trip_response
@@ -258,11 +259,12 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP
                     })
                     logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
-                    # Save public copy as well (non-blocking) using AI to select thumbnail reference
+                    # Save public copy as well (non-blocking) and enrich
                     try:
                         await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
+                        await _enrich_public_trip(trip_response, req)
                     except Exception as pub_e:
-                        logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
+                        logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
                 except Exception as ue:
                     logger.error("[generate-trip] Firestore completion update failed", extra={"trip_id": trip_id, "error": str(ue)})
             except Exception as gen_e:
@@ -358,11 +360,12 @@ async def regenerate_trip_plan(
                     req_json,
                     upd_json
                 )
-                # Update public copy as well (non-blocking)
+                # Update public copy as well (non-blocking) and enrich
                 try:
                     await itinerary_generator.create_and_save_public_trip(updated_trip, request, fs_manager)
+                    await _enrich_public_trip(updated_trip, request)
                 except Exception as pub_e:
-                    logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
+                    logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
         except Exception as persist_e:
             logger.warning("Trip update persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
         
@@ -491,6 +494,43 @@ def _compute_public_metadata(itinerary: Dict[str, Any]) -> tuple[str, str, str]:
     except Exception:
         return ("Trip Itinerary", "A memorable trip.", "")
 
+async def _enrich_public_trip(trip_response: TripPlanResponse, req: TripPlanRequest):
+    """Force-update public trip title, summary, and destination photos right after creation/update."""
+    try:
+        if fs_manager is None or not get_settings().USE_FIRESTORE:
+            return
+        itinerary_json = trip_response.model_dump(mode="json")
+        title, summary, _ = _compute_public_metadata(itinerary_json)
+        dest = itinerary_json.get("destination") or req.destination
+        photos: list[str] = []
+        try:
+            fetcher = getattr(travel_service, "fetch_destination_photos", None)
+            if callable(fetcher):
+                photos = fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
+            else:
+                photos = places_service.fetch_destination_photos(dest, max_images=3, max_width_px=800)
+        except Exception as e_ph:
+            logger.warning("[public_trip] Photo fetch during create failed", extra={"trip_id": trip_response.trip_id, "error": str(e_ph)})
+        updates: Dict[str, Any] = {"title": title, "summary": summary}
+        if photos:
+            updates["destination_photos"] = photos
+        if updates:
+            ok = await fs_manager.update_public_trip(trip_response.trip_id, updates)
+            logger.info("[public_trip] Enrichment updates applied", extra={"trip_id": trip_response.trip_id, "ok": ok, "fields": list(updates.keys())})
+    except Exception as e:
+        logger.warning("[public_trip] Enrichment step failed", extra={"error": str(e)})
+
+# --- Admin auth helper ---
+def _check_admin_token(auth_header: Optional[str]) -> bool:
+    try:
+        if not auth_header or not auth_header.lower().startswith("bearer "):
+            return False
+        token = auth_header.split(" ", 1)[1].strip()
+        settings = get_settings()
+        return bool(settings.ADMIN_API_TOKEN) and token == settings.ADMIN_API_TOKEN
+    except Exception:
+        return False
+
 @app.get("/api/v1/places/search")
 async def search_places(
     query: str,
@@ -567,6 +607,101 @@ async def get_statistics():
         return stats
     except Exception as e:
         logger.error(f"Error getting statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/public-trips")
+async def list_public_trips(page_size: int = None, page_token: str | None = None):
+    """List public trips with basic pagination."""
+    try:
+        settings = get_settings()
+        if not (settings.USE_FIRESTORE and fs_manager is not None):
+            raise HTTPException(status_code=503, detail="Public trips not available (Firestore disabled)")
+        ps = page_size or settings.PUBLIC_TRIPS_PAGE_SIZE_DEFAULT
+        ps = max(1, min(ps, settings.PUBLIC_TRIPS_PAGE_SIZE_MAX))
+        data = await fs_manager.list_public_trips(page_size=ps, page_token=page_token)
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing public trips: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class BackfillRequest(BaseModel):
+    limit: Optional[int] = 50
+    dry_run: Optional[bool] = False
+    start_after_id: Optional[str] = None
+    force: Optional[bool] = True
+
+@app.post("/api/v1/public-trips/backfill")
+async def backfill_public_trips(payload: BackfillRequest):
+    """Backfill destination_photos and improved title/summary for existing public trips.
+    Uses Places API v1 to fetch up to 3 destination photos and updates docs. Supports dry_run.
+    """
+    try:
+        settings = get_settings()
+        if not (settings.USE_FIRESTORE and fs_manager is not None):
+            raise HTTPException(status_code=503, detail="Firestore not configured")
+
+        limit = max(1, min(int(payload.limit or 50), 200))
+        page_token = payload.start_after_id
+        updated = 0
+        scanned = 0
+        updated_items = []
+        next_token = None
+        # Iterate pages until limit reached or no more
+        while scanned < limit:
+            page = await fs_manager.list_public_trips(page_size=min(50, limit - scanned), page_token=page_token)
+            items = page.get("items", [])
+            next_token = page.get("next_page_token")
+            if not items:
+                break
+            for item in items:
+                scanned += 1
+                trip_id = item.get("id")
+                itinerary = (item.get("itinerary") or {})
+                # Compute missing fields
+                dest = itinerary.get("destination") or (item.get("request", {}) or {}).get("destination") or ""
+                title, summary, _ = _compute_public_metadata(itinerary)
+                existing_photos = item.get("destination_photos") or []
+                need_photos = not existing_photos
+                need_title = (item.get("title") or "").strip() == ""
+                need_summary = (item.get("summary") or "").strip() == ""
+                updates: Dict[str, Any] = {}
+                if payload.force or need_title:
+                    updates["title"] = title
+                if payload.force or need_summary:
+                    updates["summary"] = summary
+                if (payload.force or need_photos) and dest:
+                    try:
+                        # Prefer TravelService if it exposes a suitable method; fallback to PlacesService
+                        photos = []
+                        fetcher = getattr(travel_service, "fetch_destination_photos", None)
+                        if callable(fetcher):
+                            photos = fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
+                        else:
+                            photos = places_service.fetch_destination_photos(dest, max_images=3, max_width_px=800)
+                        if photos:
+                            updates["destination_photos"] = photos
+                    except Exception as e_ph:
+                        logger.warning("Backfill photos failed", extra={"trip_id": trip_id, "error": str(e_ph)})
+                if updates:
+                    if payload.dry_run:
+                        logger.info("[backfill] DRY RUN would update", extra={"trip_id": trip_id, "updates": list(updates.keys())})
+                    else:
+                        ok = await fs_manager.update_public_trip(trip_id, updates)
+                        if ok:
+                            updated += 1
+                            updated_items.append({"id": trip_id, "updated_fields": list(updates.keys())})
+                if scanned >= limit:
+                    break
+            if not next_token or scanned >= limit:
+                break
+            page_token = next_token
+        return {"scanned": scanned, "updated": updated, "next_page_token": next_token, "items": updated_items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Backfill failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")

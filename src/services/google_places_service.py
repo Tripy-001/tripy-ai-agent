@@ -654,3 +654,50 @@ Return ONLY a JSON array of strings. Example: ["Place Name 1", "Place Name 2", "
     def get_api_calls_made(self) -> int:
         """Get total number of API calls made"""
         return self.api_calls_made
+
+    # --- Destination photos (Places API v1 Photos) ---
+    def fetch_destination_photos(self, destination: str, max_images: int = 3, max_width_px: int = 800) -> List[str]:
+        """Fetch up to max_images photo URLs for the destination using Places API v1.
+        Strategy: searchText for the destination, request photos field, and convert photo.name to media URLs.
+        Returns a list of HTTPS URLs or an empty list on failure.
+        """
+        try:
+            if max_images <= 0:
+                return []
+            # Respect per-trip cap lightly (doesn't strictly belong to a trip here, but keep counter consistent)
+            if self.max_calls_per_trip and self.api_calls_made >= self.max_calls_per_trip:
+                return []
+            url = "https://places.googleapis.com/v1/places:searchText"
+            headers = {
+                "X-Goog-Api-Key": self.api_key,
+                "X-Goog-FieldMask": (
+                    "places.id,places.displayName,places.formattedAddress,places.photos"
+                )
+            }
+            body = {"textQuery": destination, "pageSize": 1}
+            time.sleep(self.rate_limit_delay)
+            resp = self.http_client.post(url, headers=headers, json=body)
+            self.api_calls_made += 1
+            if resp.status_code != 200:
+                self.logger.warning(f"Destination photos search failed: {resp.status_code} {resp.text}")
+                return []
+            data = resp.json() or {}
+            places = data.get("places") or []
+            if not places:
+                return []
+            photos = (places[0] or {}).get("photos") or []
+            out: List[str] = []
+            for ph in photos[:max_images]:
+                try:
+                    name = ph.get("name")
+                    if not name:
+                        continue
+                    # Build public media URL as per Places API v1
+                    media_url = f"https://places.googleapis.com/v1/{name}/media?maxWidthPx={int(max_width_px)}&key={self.api_key}"
+                    out.append(media_url)
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            self.logger.warning(f"fetch_destination_photos error: {e}")
+            return []

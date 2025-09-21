@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # Prompt sizing controls
     MAX_PROMPT_PLACES_CHARS: int = 20000  # budget for compact places JSON in prompt
     MAX_PLACE_ENTRY_CHARS: int = 700      # skip oversized place entries when compacting
+
+    # Admin controls
+    ADMIN_API_TOKEN: Optional[str] = None  # simple bearer token for admin-only endpoints
+    PUBLIC_TRIPS_PAGE_SIZE_DEFAULT: int = 20
+    PUBLIC_TRIPS_PAGE_SIZE_MAX: int = 50
     
     model_config = {"env_file": ".env", "case_sensitive": True}
 

@@ -136,15 +136,41 @@ class ItineraryGeneratorService:
     async def create_and_save_public_trip(self, trip_response: TripPlanResponse, request: TripPlanRequest, fs_manager, *, title: str | None = None, summary: str | None = None) -> None:
         try:
             self.logger.info(f"[public_trip] Starting generation for trip ID: {trip_response.trip_id}")
-            # Build a simple title/summary; no thumbnail selection since photos are removed
-            out_title = title or f"{trip_response.destination}: {trip_response.trip_duration_days}-day {getattr(trip_response, 'travel_style', '')} itinerary".strip()
-            out_summary = summary or "A memorable trip."
+            # Build an enhanced title/summary derived from itinerary content
+            style = (getattr(trip_response, "travel_style", None) or "travel").strip()
+            out_title = title or f"{trip_response.destination}: {trip_response.trip_duration_days}-day {style} itinerary".strip()
+            if not summary:
+                # Use first 2 day themes, else a concise fallback
+                themes: list[str] = []
+                try:
+                    for d in (trip_response.daily_itineraries or [])[:2]:
+                        if isinstance(d, dict):
+                            t = d.get("theme")
+                        else:
+                            t = getattr(d, "theme", None)
+                        if t:
+                            themes.append(str(t))
+                except Exception:
+                    pass
+                if themes:
+                    out_summary = "; ".join(themes)
+                else:
+                    out_summary = f"Plan for {trip_response.group_size} travelers. Budget: {trip_response.total_budget} {trip_response.currency}."
+            else:
+                out_summary = summary
             # Choose a representative place_id as the thumbnail reference (best shows the destination)
             try:
                 selected_place_id = self._select_representative_place_id(trip_response)
             except Exception as sel_err:
                 self.logger.warning("[public_trip] Thumbnail selection failed", extra={"error": str(sel_err)})
                 selected_place_id = None
+
+            # Fetch up to 3 destination-level photos for public trip cards (does not affect AI response schema)
+            destination_photos: list[str] = []
+            try:
+                destination_photos = self.places_service.fetch_destination_photos(request.destination, max_images=3, max_width_px=800)
+            except Exception as ph_err:
+                self.logger.warning("[public_trip] Destination photos fetch failed", extra={"error": str(ph_err)})
 
             try:
                 await fs_manager.save_public_trip(
@@ -154,6 +180,7 @@ class ItineraryGeneratorService:
                     title=out_title,
                     summary=out_summary,
                     thumbnail_photo_reference=selected_place_id,
+                    destination_photos=destination_photos,
                 )
                 self.logger.info("[public_trip] Successfully created/updated public trip", extra={"trip_id": trip_response.trip_id})
             except Exception as fe:
