@@ -236,15 +236,10 @@ class VertexAIService:
 
                             "daily_total_cost": "number",
                             "daily_notes": ["string"],
-                            // Provide structured daily alternatives:
-                            // - attractions: additional sights/activities for this day
-                            // - meals: additional restaurants/cafes for breakfast/lunch/dinner swaps
-                            // Each entry must be a full PlaceResponse (with real place_id, coordinates, rating and user_ratings_total when available) and include a helpful why_recommended.
                             "alternative_options": {
-                                "attractions": [ /* PlaceResponse objects */ ],
-                                "meals": [ /* PlaceResponse objects (restaurants/cafes) */ ]
+                                "attractions": [ /* 1–2 PlaceResponse objects (same shape as morning.activities) */ ],
+                                "meals": [ /* 1–2 PlaceResponse objects (restaurants/cafes; same shape as morning.activities) */ ]
                             },
-                            "weather_alternatives": { "string": [ /* PlaceResponse objects */ ] }
                         }
                     ],
 
@@ -352,9 +347,11 @@ class VertexAIService:
                                                                     - Prefer higher-quality dining: when data exists, select restaurants/cafes with rating >= 4.2 and user_ratings_total >= 300; otherwise choose the best available in places_data.
                                                                     - Use must_try_cuisines and dietary_restrictions to diversify meal choices across days; mention signature dishes in why_recommended when relevant.
                                                                 - Represent meals (breakfast, lunch, dinner) as activities within the appropriate blocks, using restaurants or cafes from places_data with real place_ids. Use activity_type="meal" and estimate costs per person in the specified currency. Include rating and user_ratings_total in PlaceResponse when available.
-                                                                - Provide structured daily alternatives:
-                                                                    - alternative_options.attractions: up to 2 additional sights for the day, full PlaceResponse, each with why_recommended.
-                                                                    - alternative_options.meals: up to 2 additional restaurants/cafes suitable for that day’s meals, full PlaceResponse with cuisine angle in description/why_recommended.
+                                                                - Provide structured daily alternatives (STRICT & CONSISTENT):
+                                                                    - alternative_options.attractions: 1-2 items (at least 1; never null), each a full PlaceResponse with EXACTLY the same schema as used for the main morning.activities object (no extra/missing fields), and include why_recommended.
+                                                                    - alternative_options.meals: 1-2 items (at least 1; never null), each a full PlaceResponse (restaurant/cafe) with EXACTLY the same schema as morning.activities (no extra/missing fields), and include cuisine context in description/why_recommended.
+                                                                    - If options are scarce, you may repeat suitable places to ensure the minimum counts are met; prefer unique entries when possible.
+                                                                    - All alternative entries MUST reference real place_id values from places_data and include coordinates; do not return strings or placeholders.
                                                                 - Include realistic, destination-appropriate price estimates in the specified currency.
                                                                 - For each primary activity, prefer 1–2 alternatives drawn from provided data when possible.
                                                                 - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation, accommodations, and the travel_options array.
@@ -480,7 +477,7 @@ class VertexAIService:
                 trimmed = []
                 for p in arr[:limit]:
                     mp = _map_place(p)
-                    if mp.get("place_id") and (mp.get("coordinates") or {}).get("lat") is not None:
+                    if mp:
                         trimmed.append(mp)
                 if trimmed:
                     compact[cat] = trimmed

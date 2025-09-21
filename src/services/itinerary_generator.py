@@ -324,10 +324,51 @@ class ItineraryGeneratorService:
 
                     # Coerce alternative_options places
                     alt_opts = day.get("alternative_options")
-                    if isinstance(alt_opts, dict):
-                        for key, arr in list(alt_opts.items()):
-                            if isinstance(arr, list):
-                                alt_opts[key] = [_coerce_place(p, "attraction", f"{key} alternatives on day {day.get('day_number', '')}") for p in arr]
+                    if not isinstance(alt_opts, dict):
+                        alt_opts = {"attractions": [], "meals": []}
+                        day["alternative_options"] = alt_opts
+                    # Normalize lists
+                    if not isinstance(alt_opts.get("attractions"), list):
+                        alt_opts["attractions"] = []
+                    if not isinstance(alt_opts.get("meals"), list):
+                        alt_opts["meals"] = []
+
+                    # Coerce existing entries to PlaceResponse-like and trim to max 2
+                    for key in ("attractions", "meals"):
+                        arr = alt_opts.get(key) or []
+                        items = [_coerce_place(p, "attraction", f"{key} alternatives on day {day.get('day_number', '')}") for p in arr]
+                        alt_opts[key] = items[:2]
+
+                    # Ensure minimum counts using fallback candidates (allow repeats)
+                    def pick_best(cands: List[Dict[str, Any]], needed: int, default_cat: str) -> List[Dict[str, Any]]:
+                        if not isinstance(cands, list):
+                            return []
+                        def _score(p: Dict[str, Any]) -> float:
+                            try:
+                                return float(p.get("rating") or 0.0) * 100 + float(p.get("user_ratings_total") or 0) * 0.03
+                            except Exception:
+                                return 0.0
+                        valid = [c for c in cands if isinstance(c, dict) and c.get("place_id") and (c.get("coordinates") or {}).get("lat") is not None and (c.get("coordinates") or {}).get("lng") is not None]
+                        best = sorted(valid, key=_score, reverse=True)
+                        out: List[Dict[str, Any]] = []
+                        for p in best[:max(needed, 0)]:
+                            out.append(_coerce_place(p, default_cat, "alternative option"))
+                        return out
+
+                    # Attractions: at least 1
+                    if len(alt_opts["attractions"]) < 1:
+                        # Combine attraction-like categories
+                        attraction_pool = (fallback_lists.get("attractions") or []) + (fallback_lists.get("outdoor_activities") or []) + (fallback_lists.get("cultural_sites") or [])
+                        fill = pick_best(attraction_pool, 1, "attraction")
+                        alt_opts["attractions"].extend(fill)
+                        alt_opts["attractions"] = alt_opts["attractions"][:2]
+
+                    # Meals: at least 1
+                    if len(alt_opts["meals"]) < 1:
+                        meal_pool = fallback_lists.get("restaurants") or []
+                        fill = pick_best(meal_pool, 1, "restaurant")
+                        alt_opts["meals"].extend(fill)
+                        alt_opts["meals"] = alt_opts["meals"][:2]
 
                     # Coerce weather_alternatives places
                     weather_alts = day.get("weather_alternatives")
