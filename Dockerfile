@@ -26,8 +26,8 @@ COPY src/ ./src/
 # (Optional) Copy env/creds only if they actually exist in build context.
 # If they might be missing, comment these out to avoid COPY wildcards failing the build.
 COPY .env* ./
-COPY gcp-config.json* ./
-COPY firebase-config.json* ./
+# COPY gcp-config.json* ./
+# COPY firebase-config.json* ./
 
 # Ensure Python can import 'src' as a top-level package
 ENV PYTHONPATH="/app:/app/src"
