@@ -5,6 +5,8 @@ from decimal import Decimal
 
 from google.cloud import firestore
 from google.oauth2 import service_account
+import os
+import json
 
 from src.utils.config import get_settings
 
@@ -19,10 +21,37 @@ class FirestoreManager:
         try:
             # Prefer explicit Firestore credentials if provided (split-project support)
             credentials = None
-            if self.settings.FIRESTORE_CREDENTIALS:
-                credentials = service_account.Credentials.from_service_account_file(
-                    self.settings.FIRESTORE_CREDENTIALS
-                )
+            cred_path = self.settings.FIRESTORE_CREDENTIALS
+            if cred_path:
+                # Expand ~ and relative paths safely
+                cred_path_expanded = os.path.expanduser(cred_path)
+                if not os.path.isabs(cred_path_expanded):
+                    cred_path_expanded = os.path.abspath(cred_path_expanded)
+                if os.path.exists(cred_path_expanded):
+                    try:
+                        # Quick JSON sanity check to avoid cryptic stack traces
+                        with open(cred_path_expanded, 'r', encoding='utf-8') as f:
+                            json.load(f)
+                        credentials = service_account.Credentials.from_service_account_file(
+                            cred_path_expanded
+                        )
+                        self.logger.info(
+                            "Using explicit Firestore service account credentials",
+                            extra={"path": cred_path_expanded}
+                        )
+                    except Exception as cred_err:
+                        self.logger.warning(
+                            "Failed to load explicit Firestore credentials; falling back to ADC",
+                            extra={"path": cred_path_expanded, "error": str(cred_err)}
+                        )
+                        credentials = None  # fallback to ADC
+                else:
+                    self.logger.warning(
+                        "Firestore credential file not found; falling back to ADC",
+                        extra={"path": cred_path}
+                    )
+            else:
+                self.logger.info("No FIRESTORE_CREDENTIALS provided; using ADC (Cloud Run service account)")
             database = self.settings.FIRESTORE_DATABASE_ID or None  # default DB if None
             # Use explicit creds or fall back to ADC
             self.client = firestore.Client(project=project_id, credentials=credentials, database=database)
@@ -38,7 +67,9 @@ class FirestoreManager:
                 }
             )
         except Exception as e:
-            self.logger.exception("Failed to initialize Firestore client")
+            self.logger.exception(
+                "Failed to initialize Firestore client (check project id, ADC permissions, or credentials file)"
+            )
             raise
 
     def _collection(self):
