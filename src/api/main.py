@@ -10,13 +10,14 @@ from typing import Dict, Any, Union, Optional
 from pydantic import BaseModel
 from google.cloud import firestore as gcf
 
-from src.models.request_models import TripPlanRequest
+from src.models.request_models import TripPlanRequest, VoiceEditRequest, VoiceEditResponse, EditSuggestionsResponse
 from src.models.response_models import TripPlanResponse
 from src.services.vertex_ai_service import VertexAIService
 from src.services.google_places_service import GooglePlacesService
 from src.services.itinerary_generator import ItineraryGeneratorService
 from src.services.maps_service import MapsService
 from src.services.travel_service import TravelService
+from src.services.voice_agent_service import VoiceAgentService
 from src.utils.config import get_settings, validate_settings
 from src.utils.validators import TripRequestValidator
 from src.utils.formatters import ResponseFormatter
@@ -59,11 +60,12 @@ maps_service: MapsService = None
 travel_service: TravelService = None
 itinerary_generator: ItineraryGeneratorService = None
 fs_manager: FirestoreManager = None
+voice_agent: VoiceAgentService = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager
+    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager, voice_agent
     
     try:
         settings = get_settings()
@@ -96,6 +98,9 @@ async def startup_event():
         if settings.USE_FIRESTORE:
             try:
                 fs_manager = FirestoreManager()
+                # Initialize voice agent service
+                voice_agent = VoiceAgentService(vertex_ai_service, places_service, fs_manager)
+                logger.info("Voice agent service initialized successfully")
             except Exception as fe:
                 logger.warning("Firestore initialization failed; continuing without Firestore", extra={"error": str(fe)})
         
@@ -119,7 +124,8 @@ def get_services():
         'maps': maps_service,
         'travel': travel_service,
         'itinerary_generator': itinerary_generator,
-        'fs': fs_manager
+        'fs': fs_manager,
+        'voice_agent': voice_agent
     }
 
 class TripGenerationRequest(BaseModel):
@@ -608,6 +614,94 @@ async def get_statistics():
     except Exception as e:
         logger.error(f"Error getting statistics: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# VOICE AGENT ENDPOINTS - Trip Editing via Natural Language
+# ============================================================================
+
+@app.post("/api/v1/trip/{trip_id}/voice-edit", response_model=VoiceEditResponse)
+async def voice_edit_trip(
+    trip_id: str,
+    request: VoiceEditRequest
+):
+    """
+    Edit a trip itinerary using natural language voice commands.
+    
+    This endpoint allows users to modify their trip using simple voice commands like:
+    - "Change dinner on day 2 to Italian restaurant"
+    - "Add more adventure activities"
+    - "Remove the museum visit on day 3"
+    - "Make the trip more budget-friendly"
+    
+    The AI will understand the intent and apply the requested changes to the itinerary.
+    """
+    try:
+        logger.info(f"[voice-edit] Processing edit for trip {trip_id}", extra={"command": request.command})
+        
+        # Check if voice agent is initialized
+        if voice_agent is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Voice agent service not available. Firestore may not be enabled."
+            )
+        
+        # Process the voice edit
+        result = await voice_agent.process_voice_edit(trip_id, request.command)
+        
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "Failed to process edit request")
+            )
+        
+        logger.info(f"[voice-edit] Successfully processed edit for trip {trip_id}")
+        return VoiceEditResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[voice-edit] Error editing trip {trip_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing voice edit: {str(e)}")
+
+@app.get("/api/v1/trip/{trip_id}/edit-suggestions", response_model=EditSuggestionsResponse)
+async def get_edit_suggestions(trip_id: str):
+    """
+    Get AI-powered suggestions for possible edits to improve the itinerary.
+    
+    Returns a list of suggested edits that the user can apply via voice commands,
+    such as:
+    - Adding variety to meals
+    - Improving activity pacing
+    - Budget optimizations
+    - Adding missing local experiences
+    """
+    try:
+        logger.info(f"[voice-edit] Generating edit suggestions for trip {trip_id}")
+        
+        # Check if voice agent is initialized
+        if voice_agent is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Voice agent service not available. Firestore may not be enabled."
+            )
+        
+        # Get suggestions
+        result = await voice_agent.get_edit_suggestions(trip_id)
+        
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "Failed to generate suggestions")
+            )
+        
+        logger.info(f"[voice-edit] Generated {len(result.get('suggestions', []))} suggestions for trip {trip_id}")
+        return EditSuggestionsResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[voice-edit] Error generating suggestions for trip {trip_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating suggestions: {str(e)}")
 
 @app.get("/api/v1/public-trips")
 async def list_public_trips(page_size: int = None, page_token: str | None = None):

@@ -5,14 +5,16 @@ A comprehensive AI-powered trip planning service that uses Google Vertex AI Gemi
 ## Features
 
 - **AI-Powered Planning**: Uses Google Vertex AI Gemini Flash for intelligent itinerary generation
+- **🎤 Voice Agent (NEW!)**: Edit trips using natural language commands
 - **Real Location Data**: Integrates with Google Places API for accurate place information
 - **Structured Input/Output**: Comprehensive JSON-based request/response models
-- **Database Ready**: Structured responses suitable for database storage
+- **Database Ready**: Structured responses suitable for database storage (Firestore)
 - **Maps Integration**: Generates static maps and route information
 - **Budget Optimization**: Smart budget allocation based on travel style
 - **Cultural Sensitivity**: Considers local customs and cultural context
 - **Accessibility Support**: Accommodates special dietary and accessibility needs
 - **Group Dynamics**: Optimizes plans for different group sizes and ages
+- **AI-Powered Suggestions**: Get intelligent recommendations for improving your trip
 
 ## Project Structure
 
@@ -28,7 +30,8 @@ trip-planner-agent/
 │   │   ├── vertex_ai_service.py   # Google Vertex AI integration
 │   │   ├── google_places_service.py # Google Places API service
 │   │   ├── maps_service.py        # Maps and routing service
-│   │   └── itinerary_generator.py # Main orchestration service
+│   │   ├── itinerary_generator.py # Main orchestration service
+│   │   └── voice_agent_service.py # 🎤 Voice editing service (NEW!)
 │   ├── utils/
 │   │   ├── validators.py          # Input validation utilities
 │   │   ├── formatters.py          # Response formatting utilities
@@ -39,10 +42,14 @@ trip-planner-agent/
 │   └── prompts/
 │       └── system_prompts.py      # AI system prompts
 ├── tests/                         # Test files
+├── test_voice_agent.py           # 🎤 Voice agent test script (NEW!)
 ├── config/                        # Configuration files
 ├── requirements.txt               # Python dependencies
 ├── .env.example                   # Environment variables template
 ├── README.md                      # This file
+├── VOICE_AGENT_README.md         # 🎤 Voice agent documentation (NEW!)
+├── voice_agent_examples.md       # 🎤 Frontend integration examples (NEW!)
+├── VOICE_AGENT_SETUP.md          # 🎤 Voice agent setup guide (NEW!)
 └── docker-compose.yml            # Docker configuration
 ```
 
@@ -360,12 +367,67 @@ docker run -p 8000:8000 --env-file .env trip-planner-agent
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
+## 🎤 Voice Agent - Edit Trips with Natural Language
+
+The Voice Agent feature allows users to edit existing trip itineraries using simple, natural language commands. Powered by Vertex AI and integrated with Firestore.
+
+### Quick Example
+
+```bash
+# Edit a trip using voice/text command
+curl -X POST "http://localhost:8000/api/v1/trip/{trip_id}/voice-edit" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "Change dinner on day 2 to Italian restaurant"}'
+
+# Get AI-powered suggestions for improving the trip
+curl "http://localhost:8000/api/v1/trip/{trip_id}/edit-suggestions"
+```
+
+### Example Commands
+
+- "Change dinner on day 2 to Italian restaurant"
+- "Add more adventure activities to the trip"
+- "Remove the museum visit on day 3 morning"
+- "Make the trip more budget-friendly"
+- "Add a rest day in the middle of the trip"
+
+### Documentation
+
+- **📖 Complete Guide**: See [VOICE_AGENT_README.md](VOICE_AGENT_README.md)
+- **💻 Frontend Examples**: See [voice_agent_examples.md](voice_agent_examples.md)
+- **⚙️ Setup Guide**: See [VOICE_AGENT_SETUP.md](VOICE_AGENT_SETUP.md)
+- **🧪 Test Script**: Run `python test_voice_agent.py`
+
+### API Endpoints
+
+**POST** `/api/v1/trip/{trip_id}/voice-edit`
+- Edit trip using natural language
+- Request: `{"command": "your edit command"}`
+- Response: Updated itinerary with change summary
+
+**GET** `/api/v1/trip/{trip_id}/edit-suggestions`
+- Get AI-powered suggestions
+- Response: List of improvements with example commands
+
+### How It Works
+
+1. User provides natural language command
+2. Vertex AI parses the intent
+3. System fetches current itinerary from Firestore
+4. Google Places API searches for new places (if needed)
+5. Vertex AI applies the edit
+6. Updated itinerary saved to Firestore
+7. Returns updated trip with summary
+
+Perfect for hackathons and demos! 🚀
+
 ## Support
 
 For support and questions:
 - Create an issue in the repository
 - Check the API documentation at `/docs`
 - Review the example requests in the README
+- For Voice Agent: See [VOICE_AGENT_SETUP.md](VOICE_AGENT_SETUP.md)
 
 ## Roadmap
 

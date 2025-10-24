@@ -830,8 +830,10 @@ class VertexAIService:
     def generate_json_from_prompt(self, prompt: str, temperature: float = 0.4) -> str:
         """Generate a JSON string response for a given prompt using the same model.
         Returns raw text; caller should parse JSON and handle exceptions.
+        Raises exception if generation fails.
         """
         try:
+            self.logger.debug(f"[vertex] generate_json_from_prompt called with temp={temperature}")
             response = self.model.generate_content(
                 [prompt],
                 generation_config={
@@ -843,6 +845,7 @@ class VertexAIService:
             # Try to extract text content
             text_attr = getattr(response, "text", None)
             if isinstance(text_attr, str) and text_attr.strip():
+                self.logger.debug(f"[vertex] Response text length: {len(text_attr)}")
                 return text_attr
             # Fallback to concatenating parts
             parts_text: list[str] = []
@@ -852,7 +855,14 @@ class VertexAIService:
                     t = getattr(part, "text", None)
                     if t:
                         parts_text.append(t)
-            return "\n".join(parts_text).strip()
+            result = "\n".join(parts_text).strip()
+            if result:
+                self.logger.debug(f"[vertex] Response from parts, length: {len(result)}")
+                return result
+            else:
+                self.logger.warning("[vertex] Empty response from model")
+                return "{}"
         except Exception as e:
-            self.logger.error(f"[vertex] generate_json_from_prompt failed: {e}")
-            return "{}"
+            self.logger.error(f"[vertex] generate_json_from_prompt failed: {e}", exc_info=True)
+            # Re-raise the exception instead of silently returning empty JSON
+            raise RuntimeError(f"Vertex AI generation failed: {str(e)}") from e
