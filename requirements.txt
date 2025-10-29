@@ -63,6 +63,8 @@ geopy>=2.4.0
 
 # Rate limiting
 slowapi>=0.1.9
+tenacity>=8.2.0  # Retry logic with exponential backoff
+
 
 # Background tasks
 celery>=5.3.0

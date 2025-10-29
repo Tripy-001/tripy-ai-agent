@@ -198,37 +198,40 @@ Return ONLY the JSON object, no additional text."""
             if category == "restaurant" or cuisine_type:
                 # Search for restaurants
                 query = f"{cuisine_type or ''} restaurant in {destination}".strip()
-                coordinates = self.places_service._geocode_destination(destination)
-                results = self.places_service._places_search_text_v1(
+                coordinates = await self.places_service._geocode_destination_async(destination)
+                search_result = await self.places_service._places_search_text_v1_async(
                     text_query=query,
                     coordinates=coordinates,
                     radius=5000,
-                    page_size=10
+                    page_size=10,
+                    category="restaurants"
                 )
-                places = [self.places_service._transform_place_v1(p) for p in results[:5]]
+                places = search_result.get("places", [])[:5]
             
             elif category == "attraction":
                 # Search for attractions
                 query = f"{desired_change.get('activity_type', '')} attraction in {destination}".strip()
-                coordinates = self.places_service._geocode_destination(destination)
-                results = self.places_service._places_search_text_v1(
+                coordinates = await self.places_service._geocode_destination_async(destination)
+                search_result = await self.places_service._places_search_text_v1_async(
                     text_query=query,
                     coordinates=coordinates,
                     radius=5000,
-                    page_size=10
+                    page_size=10,
+                    category="attractions"
                 )
-                places = [self.places_service._transform_place_v1(p) for p in results[:5]]
+                places = search_result.get("places", [])[:5]
             
             elif search_query:
                 # Use the search query directly
-                coordinates = self.places_service._geocode_destination(destination)
-                results = self.places_service._places_search_text_v1(
+                coordinates = await self.places_service._geocode_destination_async(destination)
+                search_result = await self.places_service._places_search_text_v1_async(
                     text_query=f"{search_query} in {destination}",
                     coordinates=coordinates,
                     radius=5000,
-                    page_size=10
+                    page_size=10,
+                    category="general"
                 )
-                places = [self.places_service._transform_place_v1(p) for p in results[:5]]
+                places = search_result.get("places", [])[:5]
             
             return {
                 "category": category,

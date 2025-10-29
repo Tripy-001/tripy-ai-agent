@@ -36,7 +36,7 @@ class ItineraryGeneratorService:
             
             # Step 1: Fetch places data from Google Places API
             self.logger.info("[itinerary] Fetching places data (Places API)")
-            places_data = self.places_service.fetch_all_places_for_trip(request)
+            places_data = await self.places_service.fetch_all_places_for_trip(request)
             self.logger.debug(
                 "[itinerary] Places data fetched",
                 extra={
@@ -168,7 +168,7 @@ class ItineraryGeneratorService:
             # Fetch up to 3 destination-level photos for public trip cards (does not affect AI response schema)
             destination_photos: list[str] = []
             try:
-                destination_photos = self.places_service.fetch_destination_photos(request.destination, max_images=3, max_width_px=800)
+                destination_photos = await self.places_service.fetch_destination_photos(request.destination, max_images=3, max_width_px=800)
             except Exception as ph_err:
                 self.logger.warning("[public_trip] Destination photos fetch failed", extra={"error": str(ph_err)})
 

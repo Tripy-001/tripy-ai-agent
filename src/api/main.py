@@ -5,6 +5,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 import logging
 import uuid
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, Union, Optional
 from pydantic import BaseModel
@@ -18,6 +19,7 @@ from src.services.itinerary_generator import ItineraryGeneratorService
 from src.services.maps_service import MapsService
 from src.services.travel_service import TravelService
 from src.services.voice_agent_service import VoiceAgentService
+from src.services.photo_enrichment_service import PhotoEnrichmentService
 from src.utils.config import get_settings, validate_settings
 from src.utils.validators import TripRequestValidator
 from src.utils.formatters import ResponseFormatter
@@ -61,11 +63,12 @@ travel_service: TravelService = None
 itinerary_generator: ItineraryGeneratorService = None
 fs_manager: FirestoreManager = None
 voice_agent: VoiceAgentService = None
+photo_service: PhotoEnrichmentService = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager, voice_agent
+    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager, voice_agent, photo_service
     
     try:
         settings = get_settings()
@@ -92,6 +95,7 @@ async def startup_event():
         places_service = GooglePlacesService(api_key=settings.GOOGLE_MAPS_API_KEY)
         maps_service = MapsService(api_key=settings.GOOGLE_MAPS_API_KEY)
         travel_service = TravelService()
+        photo_service = PhotoEnrichmentService(api_key=settings.GOOGLE_MAPS_API_KEY)
         
         itinerary_generator = ItineraryGeneratorService(vertex_ai_service, places_service, travel_service)
         # Initialize Firestore if enabled
@@ -125,8 +129,74 @@ def get_services():
         'travel': travel_service,
         'itinerary_generator': itinerary_generator,
         'fs': fs_manager,
-        'voice_agent': voice_agent
+        'voice_agent': voice_agent,
+        'photo': photo_service
     }
+
+# Helper function to enrich trip with photos
+async def _enrich_trip_with_photos(trip_id: str, is_public: bool = False):
+    """
+    Enrich a trip (regular or public) with photos in the background.
+    
+    For regular trips: enriches itinerary with place photos
+    For public trips: enriches itinerary + adds destination_photos field
+    """
+    try:
+        if not fs_manager or not photo_service:
+            logger.warning(f"Cannot enrich photos for trip {trip_id}: services not available")
+            return
+        
+        collection_name = "public_trips" if is_public else fs_manager.collection_name
+        doc_ref = fs_manager.client.collection(collection_name).document(trip_id)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            logger.warning(f"Trip {trip_id} not found for photo enrichment")
+            return
+        
+        trip_data = doc.to_dict()
+        
+        # Handle different trip data structures
+        if "itinerary" in trip_data:
+            itinerary_data = trip_data.get("itinerary")
+        else:
+            itinerary_data = trip_data
+        
+        if not itinerary_data:
+            logger.warning(f"No itinerary data for trip {trip_id}")
+            return
+        
+        # Enrich itinerary with photos
+        enriched_itinerary = await photo_service.enrich_trip_with_photos(
+            itinerary_data,
+            max_photos_per_place=3,
+            photo_size="medium"
+        )
+        
+        # Update trip data
+        if "itinerary" in trip_data:
+            trip_data["itinerary"] = enriched_itinerary
+        else:
+            trip_data = enriched_itinerary
+        
+        # For public trips, also add destination_photos
+        if is_public:
+            destination_photos = photo_service.extract_destination_photos(
+                enriched_itinerary,
+                max_photos=5
+            )
+            trip_data["destination_photos"] = destination_photos
+            logger.info(f"Added {len(destination_photos)} destination photos to public trip {trip_id}")
+        
+        trip_data["last_updated"] = datetime.utcnow().isoformat()
+        
+        # Save to Firestore
+        doc_ref.set(trip_data, merge=True)
+        
+        logger.info(f"Successfully enriched {'public ' if is_public else ''}trip {trip_id} with photos")
+        
+    except Exception as e:
+        logger.error(f"Failed to enrich {'public ' if is_public else ''}trip {trip_id} with photos: {str(e)}")
 
 class TripGenerationRequest(BaseModel):
     tripId: str
@@ -202,7 +272,7 @@ async def generate_trip_plan(
             masked = f"{maps_key[:4]}...{maps_key[-4:]}" if maps_key and len(maps_key) > 8 else (maps_key or "<missing>")
             logger.info("[generate-trip] Maps API key (masked)", extra={"maps_key": masked})
             logger.info("[generate-trip] Geocoding destination pre-check", extra={"destination": req.destination})
-            _coords = places_service._geocode_destination(req.destination)
+            _coords = await places_service._geocode_destination_async(req.destination)
             logger.info("[generate-trip] Geocoding result", extra={"coords": _coords if _coords else "<none>"})
             if not _coords:
                 raise HTTPException(status_code=502, detail="Geocoding failed: Could not resolve destination coordinates. Check GOOGLE_MAPS_API_KEY and quota.")
@@ -233,10 +303,15 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP,
                         "createdAt": gcf.SERVER_TIMESTAMP,
                     }, merge=True)
+                    
+                    # Enrich regular trip with photos in background
+                    background_tasks.add_task(_enrich_trip_with_photos, trip_id, False)
+                    
                     # Also create/update a public copy of the trip (non-blocking)
                     try:
                         await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
-                        await _enrich_public_trip(trip_response, req)
+                        # Enrich public trip with photos in background (uses same trip_id)
+                        background_tasks.add_task(_enrich_trip_with_photos, trip_id, True)
                     except Exception as pub_e:
                         logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
             except Exception as persist_e:
@@ -265,10 +340,15 @@ async def generate_trip_plan(
                         "updatedAt": gcf.SERVER_TIMESTAMP
                     })
                     logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
+                    
+                    # Enrich regular trip with photos
+                    background_tasks.add_task(_enrich_trip_with_photos, trip_id, False)
+                    
                     # Save public copy as well (non-blocking) and enrich
                     try:
                         await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
-                        await _enrich_public_trip(trip_response, req)
+                        # Enrich public trip with photos (uses same trip_id)
+                        background_tasks.add_task(_enrich_trip_with_photos, trip_id, True)
                     except Exception as pub_e:
                         logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
                 except Exception as ue:
@@ -366,12 +446,11 @@ async def regenerate_trip_plan(
                     req_json,
                     upd_json
                 )
-                # Update public copy as well (non-blocking) and enrich
+                # Update public copy as well (non-blocking)
                 try:
                     await itinerary_generator.create_and_save_public_trip(updated_trip, request, fs_manager)
-                    await _enrich_public_trip(updated_trip, request)
                 except Exception as pub_e:
-                    logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
+                    logger.warning("Public trip save failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
         except Exception as persist_e:
             logger.warning("Trip update persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
         
@@ -500,32 +579,6 @@ def _compute_public_metadata(itinerary: Dict[str, Any]) -> tuple[str, str, str]:
     except Exception:
         return ("Trip Itinerary", "A memorable trip.", "")
 
-async def _enrich_public_trip(trip_response: TripPlanResponse, req: TripPlanRequest):
-    """Force-update public trip title, summary, and destination photos right after creation/update."""
-    try:
-        if fs_manager is None or not get_settings().USE_FIRESTORE:
-            return
-        itinerary_json = trip_response.model_dump(mode="json")
-        title, summary, _ = _compute_public_metadata(itinerary_json)
-        dest = itinerary_json.get("destination") or req.destination
-        photos: list[str] = []
-        try:
-            fetcher = getattr(travel_service, "fetch_destination_photos", None)
-            if callable(fetcher):
-                photos = fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
-            else:
-                photos = places_service.fetch_destination_photos(dest, max_images=3, max_width_px=800)
-        except Exception as e_ph:
-            logger.warning("[public_trip] Photo fetch during create failed", extra={"trip_id": trip_response.trip_id, "error": str(e_ph)})
-        updates: Dict[str, Any] = {"title": title, "summary": summary}
-        if photos:
-            updates["destination_photos"] = photos
-        if updates:
-            ok = await fs_manager.update_public_trip(trip_response.trip_id, updates)
-            logger.info("[public_trip] Enrichment updates applied", extra={"trip_id": trip_response.trip_id, "ok": ok, "fields": list(updates.keys())})
-    except Exception as e:
-        logger.warning("[public_trip] Enrichment step failed", extra={"error": str(e)})
-
 # --- Admin auth helper ---
 def _check_admin_token(auth_header: Optional[str]) -> bool:
     try:
@@ -548,23 +601,26 @@ async def search_places(
     try:
         logger.info(f"Searching places: {query} in {location}")
 
-        coordinates = places_service._geocode_destination(location)
+        coordinates = await places_service._geocode_destination_async(location)
         if not coordinates:
             logger.warning("Geocode failed, proceeding without location bias", extra={"location": location})
 
         text_query = f"{query} in {location}" if not category else f"{query} {category} in {location}"
-        results = places_service._places_search_text_v1(
+        # Use async version and await the result
+        search_result = await places_service._places_search_text_v1_async(
             text_query=text_query,
             coordinates=coordinates,
             radius=radius,
-            page_size=10
+            page_size=10,
+            category="search"
         )
+        
+        results = search_result.get("places", [])
 
         places = []
         for place in results[:10]:
-            transformed = places_service._transform_place_v1(place)
-            if transformed:
-                places.append(transformed)
+            if place:  # place is already transformed
+                places.append(place)
 
         return {
             "query": query,
@@ -771,9 +827,14 @@ async def backfill_public_trips(payload: BackfillRequest):
                         photos = []
                         fetcher = getattr(travel_service, "fetch_destination_photos", None)
                         if callable(fetcher):
-                            photos = fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
+                            # Check if it's async
+                            if asyncio.iscoroutinefunction(fetcher):
+                                photos = await fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
+                            else:
+                                photos = fetcher(dest, max_images=3, max_width_px=800)  # type: ignore[arg-type]
                         else:
-                            photos = places_service.fetch_destination_photos(dest, max_images=3, max_width_px=800)
+                            # places_service.fetch_destination_photos is async
+                            photos = await places_service.fetch_destination_photos(dest, max_images=3, max_width_px=800)
                         if photos:
                             updates["destination_photos"] = photos
                     except Exception as e_ph:
@@ -843,6 +904,183 @@ async def root():
         "docs": "/docs",
         "health": "/health"
     }
+
+# =============================================================================
+# PHOTO ENRICHMENT ENDPOINTS
+# =============================================================================
+
+@app.post("/api/v1/trips/{trip_id}/enrich-photos")
+async def enrich_trip_photos(
+    trip_id: str,
+    max_photos_per_place: int = 3,
+    photo_size: str = "medium",
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Enrich an existing trip with photo URLs (lazy loading).
+    
+    This endpoint fetches photos for all places in a trip itinerary and updates
+    the trip in Firestore with photo URLs. Photos are cached for 7 days.
+    
+    Args:
+        trip_id: ID of the trip to enrich
+        max_photos_per_place: Max photos per place (1-5, default 3)
+        photo_size: Photo size - small (400px), medium (800px), large (1200px)
+        background_tasks: FastAPI background tasks (for async processing)
+    
+    Returns:
+        200 OK: { "trip_id": "...", "photos_added": 42, "trip": {...} }
+        404 Not Found: Trip not found
+        500 Error: Photo enrichment failed
+    
+    Performance:
+        - ~100 places: 5-10 seconds (first time)
+        - ~100 places: <1 second (cached)
+    
+    Use Cases:
+        - User clicks "Load Photos" button in UI
+        - Automatic enrichment after trip generation
+        - Re-enrich after trip edits
+    """
+    try:
+        if not fs_manager:
+            raise HTTPException(status_code=503, detail="Firestore not available")
+        
+        if not photo_service:
+            raise HTTPException(status_code=503, detail="Photo service not available")
+        
+        # Validate parameters
+        if max_photos_per_place < 1 or max_photos_per_place > 5:
+            raise HTTPException(status_code=400, detail="max_photos_per_place must be between 1 and 5")
+        
+        if photo_size not in ["small", "medium", "large"]:
+            raise HTTPException(status_code=400, detail="photo_size must be one of: small, medium, large")
+        
+        logger.info(f"Enriching trip with photos", extra={
+            "trip_id": trip_id,
+            "max_photos": max_photos_per_place,
+            "photo_size": photo_size
+        })
+        
+        # Fetch trip from Firestore
+        trip_doc = fs_manager._collection().document(trip_id).get()
+        
+        if not trip_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
+        
+        trip_data = trip_doc.to_dict()
+        itinerary_data = trip_data.get("itinerary", {})
+        
+        # Enrich with photos
+        enriched_itinerary = await photo_service.enrich_trip_with_photos(
+            itinerary_data,
+            max_photos_per_place=max_photos_per_place,
+            photo_size=photo_size
+        )
+        
+        # Update trip in Firestore
+        trip_data["itinerary"] = enriched_itinerary
+        trip_data["last_updated"] = datetime.utcnow().isoformat()
+        
+        fs_manager._collection().document(trip_id).set(trip_data, merge=True)
+        
+        # Count photos added
+        place_ids = photo_service._extract_all_place_ids(enriched_itinerary)
+        unique_place_ids = list(set(place_ids))
+        photos_added = sum(1 for pid in unique_place_ids if enriched_itinerary.get(pid, {}).get("has_photos"))
+        
+        stats = photo_service.get_stats()
+        
+        logger.info(f"Photo enrichment complete", extra={
+            "trip_id": trip_id,
+            "total_places": len(place_ids),
+            "unique_places": len(unique_place_ids),
+            "photos_added": photos_added,
+            **stats
+        })
+        
+        return {
+            "trip_id": trip_id,
+            "photos_added": stats.get("photos_fetched", 0),
+            "total_places": len(unique_place_ids),
+            "cache_hit_rate": stats.get("cache_hit_rate"),
+            "photo_size": photo_size,
+            "success": True,
+            "message": "Photos enriched successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Photo enrichment failed for trip {trip_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Photo enrichment failed: {str(e)}")
+
+
+@app.get("/api/v1/trips/{trip_id}/photo-status")
+async def get_photo_status(trip_id: str):
+    """
+    Check if a trip has been enriched with photos.
+    
+    Returns:
+        {
+            "trip_id": "...",
+            "has_photos": true,
+            "total_places": 45,
+            "places_with_photos": 42,
+            "coverage": 0.93,
+            "last_enriched": "2025-04-29T10:30:00Z"
+        }
+    """
+    try:
+        if not fs_manager:
+            raise HTTPException(status_code=503, detail="Firestore not available")
+        
+        # Fetch trip from Firestore
+        trip_doc = fs_manager._collection().document(trip_id).get()
+        
+        if not trip_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
+        
+        trip_data = trip_doc.to_dict()
+        itinerary_data = trip_data.get("itinerary", {})
+        
+        # Count places and photos
+        total_places = 0
+        places_with_photos = 0
+        
+        def count_photos_in_dict(data):
+            nonlocal total_places, places_with_photos
+            if isinstance(data, dict):
+                if "place_id" in data:
+                    total_places += 1
+                    if data.get("has_photos"):
+                        places_with_photos += 1
+                for value in data.values():
+                    count_photos_in_dict(value)
+            elif isinstance(data, list):
+                for item in data:
+                    count_photos_in_dict(item)
+        
+        count_photos_in_dict(itinerary_data)
+        
+        coverage = (places_with_photos / max(1, total_places)) if total_places > 0 else 0.0
+        
+        return {
+            "trip_id": trip_id,
+            "has_photos": itinerary_data.get("photos_enriched_at") is not None,
+            "total_places": total_places,
+            "places_with_photos": places_with_photos,
+            "coverage": round(coverage, 2),
+            "last_enriched": itinerary_data.get("photos_enriched_at"),
+            "enrichment_version": itinerary_data.get("photo_enrichment_version")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Photo status check failed for trip {trip_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Photo status check failed: {str(e)}")
+
 
 # Error handlers
 @app.exception_handler(HTTPException)

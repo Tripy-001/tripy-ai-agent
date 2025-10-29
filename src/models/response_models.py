@@ -38,6 +38,11 @@ class PlaceResponse(BaseModel):
     why_recommended: str
     booking_required: bool = Field(default=False)
     booking_url: Optional[str] = None
+    
+    # Photo fields (added for lazy photo enrichment - backward compatible)
+    photo_urls: List[str] = Field(default_factory=list, description="Max 3 photo URLs for this place")
+    primary_photo: Optional[str] = Field(default=None, description="Primary photo URL for thumbnails")
+    has_photos: bool = Field(default=False, description="Quick check if photos have been loaded")
 
 class MealResponse(BaseModel):
     restaurant: PlaceResponse
@@ -160,3 +165,7 @@ class TripPlanResponse(BaseModel):
     last_updated: datetime
     data_freshness_score: float = Field(default=1.0)  # 0-1 score
     confidence_score: float = Field(default=1.0)  # AI confidence in recommendations
+    
+    # Photo enrichment metadata (for lazy photo loading)
+    photos_enriched_at: Optional[datetime] = Field(default=None, description="When photos were last enriched")
+    photo_enrichment_version: Optional[str] = Field(default=None, description="Version of photo enrichment")
