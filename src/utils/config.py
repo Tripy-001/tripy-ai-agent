@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     GOOGLE_CLOUD_LOCATION: str = "us-central1"
     GOOGLE_MAPS_API_KEY: str = "your-google-maps-key"
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
+    FIREBASE_SERVICE_ACCOUNT_PATH: Optional[str] = None
     FIRESTORE_PROJECT_ID: Optional[str] = None
     FIRESTORE_CREDENTIALS: Optional[str] = None  # path to Firestore service account json
     FIRESTORE_DATABASE_ID: Optional[str] = None  # defaults to '(default)'

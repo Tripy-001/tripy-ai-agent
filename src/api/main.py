@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect, Query
 import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -6,10 +6,12 @@ from fastapi.responses import JSONResponse
 import logging
 import uuid
 import asyncio
-from datetime import datetime
-from typing import Dict, Any, Union, Optional
+from datetime import datetime, timedelta
+from typing import Dict, Any, Union, Optional, List
 from pydantic import BaseModel
 from google.cloud import firestore as gcf
+import json
+from collections import defaultdict
 
 from src.models.request_models import TripPlanRequest, VoiceEditRequest, VoiceEditResponse, EditSuggestionsResponse
 from src.models.response_models import TripPlanResponse
@@ -20,10 +22,12 @@ from src.services.maps_service import MapsService
 from src.services.travel_service import TravelService
 from src.services.voice_agent_service import VoiceAgentService
 from src.services.photo_enrichment_service import PhotoEnrichmentService
+from src.services.chat_assistant_service import ChatAssistantService
 from src.utils.config import get_settings, validate_settings
 from src.utils.validators import TripRequestValidator
 from src.utils.formatters import ResponseFormatter
 from src.utils.firestore_manager import FirestoreManager
+from src.utils.firebase_auth import initialize_firebase_admin, verify_firebase_token, is_firebase_initialized
 
 # Configure logging
 logging.basicConfig(
@@ -64,11 +68,21 @@ itinerary_generator: ItineraryGeneratorService = None
 fs_manager: FirestoreManager = None
 voice_agent: VoiceAgentService = None
 photo_service: PhotoEnrichmentService = None
+chat_assistant: ChatAssistantService = None
+
+# WebSocket connection management
+active_websocket_connections: Dict[str, WebSocket] = {}
+websocket_conversation_histories: Dict[str, List[dict]] = {}
+websocket_rate_limits: Dict[str, List[datetime]] = defaultdict(list)
+
+# Rate limiting config
+MAX_MESSAGES_PER_MINUTE = 10
+WEBSOCKET_TIMEOUT_SECONDS = 300  # 5 minutes
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager, voice_agent, photo_service
+    global vertex_ai_service, places_service, maps_service, travel_service, itinerary_generator, fs_manager, voice_agent, photo_service, chat_assistant
     
     try:
         settings = get_settings()
@@ -105,8 +119,23 @@ async def startup_event():
                 # Initialize voice agent service
                 voice_agent = VoiceAgentService(vertex_ai_service, places_service, fs_manager)
                 logger.info("Voice agent service initialized successfully")
+                
+                # Initialize chat assistant service with voice agent for trip modifications
+                chat_assistant = ChatAssistantService(vertex_ai_service, fs_manager, voice_agent)
+                logger.info("Chat assistant service initialized successfully")
             except Exception as fe:
                 logger.warning("Firestore initialization failed; continuing without Firestore", extra={"error": str(fe)})
+        
+        # Initialize Firebase Admin SDK for authentication
+        try:
+            initialize_firebase_admin()
+            if is_firebase_initialized():
+                logger.info("Firebase Admin SDK initialized - WebSocket authentication enabled")
+            else:
+                logger.warning("Firebase Admin SDK not initialized - WebSocket authentication disabled")
+        except Exception as fb_error:
+            logger.warning(f"Firebase Admin SDK initialization failed: {fb_error}")
+            logger.warning("WebSocket authentication will not work without Firebase Admin SDK")
         
         logger.info("All services initialized successfully")
         
@@ -1082,7 +1111,342 @@ async def get_photo_status(trip_id: str):
         raise HTTPException(status_code=500, detail=f"Photo status check failed: {str(e)}")
 
 
-# Error handlers
+# ============================================================================
+# WebSocket Chat Assistant Endpoints
+# ============================================================================
+
+def check_websocket_rate_limit(user_id: str) -> bool:
+    """
+    Check if user has exceeded WebSocket message rate limit.
+    
+    Args:
+        user_id: Firebase user ID
+    
+    Returns:
+        True if within rate limit, False if exceeded
+    """
+    now = datetime.utcnow()
+    one_minute_ago = now - timedelta(minutes=1)
+    
+    # Clean old timestamps
+    websocket_rate_limits[user_id] = [
+        ts for ts in websocket_rate_limits[user_id]
+        if ts > one_minute_ago
+    ]
+    
+    # Check limit
+    if len(websocket_rate_limits[user_id]) >= MAX_MESSAGES_PER_MINUTE:
+        return False
+    
+    # Add current timestamp
+    websocket_rate_limits[user_id].append(now)
+    return True
+
+
+@app.websocket("/ws/{trip_id}")
+async def websocket_chat_endpoint(
+    websocket: WebSocket,
+    trip_id: str,
+    token: str = Query(...)
+):
+    """
+    WebSocket endpoint for AI travel assistant chat.
+    
+    Provides real-time conversational assistance for trip planning.
+    
+    **Authentication**: Requires Firebase ID token as query parameter
+    
+    **Connection URL**: `ws://localhost:8000/ws/{trip_id}?token={firebase_id_token}`
+    
+    **Message Protocol**:
+    
+    Client → Server:
+    ```json
+    {
+        "type": "message",
+        "message": "What's the best time to visit Bali?",
+        "timestamp": "2025-10-29T12:34:56Z"
+    }
+    ```
+    
+    Server → Client (typing indicator - start):
+    ```json
+    {
+        "type": "typing",
+        "isTyping": true,
+        "message": "Thinking..."
+    }
+    ```
+    
+    Server → Client (typing indicator - stop):
+    ```json
+    {
+        "type": "typing",
+        "isTyping": false
+    }
+    ```
+    
+    Server → Client (AI response):
+    ```json
+    {
+        "type": "message",
+        "message": "Based on your itinerary...",
+        "timestamp": "2025-10-29T12:34:58Z"
+    }
+    ```
+    
+    Server → Client (error):
+    ```json
+    {
+        "type": "error",
+        "message": "Error description",
+        "code": "ERROR_CODE"
+    }
+    ```
+    
+    **Rate Limiting**: 10 messages per minute per user
+    
+    **Timeout**: 5 minutes of inactivity
+    """
+    connection_id = f"{trip_id}_{id(websocket)}"
+    user_id = None
+    
+    try:
+        # Check if chat assistant is available
+        if not chat_assistant:
+            logger.error("[ws] Chat assistant service not initialized")
+            await websocket.close(code=1011, reason="Service unavailable")
+            return
+        
+        if not is_firebase_initialized():
+            logger.error("[ws] Firebase Admin not initialized - authentication disabled")
+            await websocket.close(code=1011, reason="Authentication service unavailable")
+            return
+        
+        # Step 1: Verify Firebase token
+        try:
+            decoded_token = await verify_firebase_token(token)
+            user_id = decoded_token['uid']
+            logger.info(f"[ws] User {user_id[:12]}... connecting to trip {trip_id}")
+        except ValueError as e:
+            logger.warning(f"[ws] Auth failed: {e}")
+            await websocket.close(code=1008, reason="Invalid or expired token")
+            return
+        
+        # Step 2: Validate trip access
+        try:
+            is_valid, trip_context, error_msg = await chat_assistant.validate_trip_access(trip_id, user_id)
+            if not is_valid:
+                logger.warning(f"[ws] Access denied: {error_msg}")
+                await websocket.close(code=1008, reason=error_msg or "Access denied")
+                return
+        except Exception as e:
+            logger.error(f"[ws] Trip validation error: {str(e)}")
+            await websocket.close(code=1011, reason="Trip validation failed")
+            return
+        
+        # Step 3: Accept WebSocket connection
+        await websocket.accept()
+        active_websocket_connections[connection_id] = websocket
+        websocket_conversation_histories[connection_id] = []
+        
+        logger.info(f"[ws] Connected: {connection_id}")
+        
+        # Step 4: Send welcome message
+        try:
+            welcome_msg = await chat_assistant.get_welcome_message(trip_context)
+            await websocket.send_json({
+                "type": "message",
+                "message": welcome_msg,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            })
+        except Exception as e:
+            logger.error(f"[ws] Welcome message failed: {str(e)}")
+        
+        # Step 5: Message loop
+        while True:
+            try:
+                # Receive message with timeout
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=WEBSOCKET_TIMEOUT_SECONDS
+                )
+                
+                # Parse message
+                try:
+                    message_data = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"[ws] Invalid JSON from {connection_id}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Invalid message format",
+                        "code": "INVALID_JSON"
+                    })
+                    continue
+                
+                # Check message type
+                if message_data.get("type") != "message":
+                    continue
+                
+                user_message = message_data.get("message", "").strip()
+                if not user_message:
+                    continue
+                
+                logger.info(f"[ws] Message from {connection_id}: {user_message[:50]}...")
+                
+                # Check rate limit
+                if not check_websocket_rate_limit(user_id):
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Too many messages. Please wait a moment.",
+                        "code": "RATE_LIMIT"
+                    })
+                    continue
+                
+                # Add to conversation history
+                websocket_conversation_histories[connection_id].append({
+                    "role": "user",
+                    "content": user_message
+                })
+                
+                # Send typing indicator to show the assistant is thinking
+                await websocket.send_json({
+                    "type": "typing",
+                    "isTyping": True,
+                    "message": "Thinking..."
+                })
+                
+                # Add a small delay to ensure the typing indicator is visible
+                await asyncio.sleep(0.3)
+                
+                # Generate AI response
+                try:
+                    ai_response = await chat_assistant.generate_response(
+                        user_message=user_message,
+                        trip_context=trip_context,
+                        conversation_history=websocket_conversation_histories[connection_id],
+                        user_id=user_id
+                    )
+                    
+                    # Send stop typing indicator
+                    await websocket.send_json({
+                        "type": "typing",
+                        "isTyping": False
+                    })
+                    
+                    # Add AI response to history
+                    websocket_conversation_histories[connection_id].append({
+                        "role": "assistant",
+                        "content": ai_response
+                    })
+                    
+                    # Send AI response
+                    await websocket.send_json({
+                        "type": "message",
+                        "message": ai_response,
+                        "timestamp": datetime.utcnow().isoformat() + "Z"
+                    })
+                    
+                    logger.info(f"[ws] AI response sent to {connection_id}")
+                    
+                except Exception as ai_error:
+                    logger.error(f"[ws] AI generation error: {ai_error}", exc_info=True)
+                    
+                    # Stop typing on error
+                    await websocket.send_json({
+                        "type": "typing",
+                        "isTyping": False
+                    })
+                    
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "I'm having trouble generating a response. Please try again.",
+                        "code": "AI_ERROR"
+                    })
+                
+            except asyncio.TimeoutError:
+                logger.info(f"[ws] Connection timeout: {connection_id}")
+                break
+            except WebSocketDisconnect:
+                logger.info(f"[ws] Client disconnected: {connection_id}")
+                break
+            except Exception as loop_error:
+                logger.error(f"[ws] Message loop error: {loop_error}", exc_info=True)
+                break
+    
+    except Exception as e:
+        logger.error(f"[ws] WebSocket error for {connection_id}: {e}", exc_info=True)
+    
+    finally:
+        # Cleanup
+        if connection_id in active_websocket_connections:
+            del active_websocket_connections[connection_id]
+        if connection_id in websocket_conversation_histories:
+            del websocket_conversation_histories[connection_id]
+        if user_id and user_id in websocket_rate_limits:
+            # Clean up old rate limit entries
+            now = datetime.utcnow()
+            one_minute_ago = now - timedelta(minutes=1)
+            websocket_rate_limits[user_id] = [
+                ts for ts in websocket_rate_limits[user_id]
+                if ts > one_minute_ago
+            ]
+        logger.info(f"[ws] Cleaned up connection: {connection_id}")
+
+
+@app.get("/ws-health")
+async def websocket_health_check():
+    """
+    Health check endpoint for WebSocket service.
+    
+    Returns:
+        {
+            "status": "healthy",
+            "firebase_initialized": true,
+            "chat_assistant_available": true,
+            "active_connections": 5,
+            "timestamp": "2025-10-29T12:34:56Z"
+        }
+    """
+    return {
+        "status": "healthy",
+        "firebase_initialized": is_firebase_initialized(),
+        "chat_assistant_available": chat_assistant is not None,
+        "active_connections": len(active_websocket_connections),
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+@app.get("/ws-metrics")
+async def websocket_metrics():
+    """
+    Metrics endpoint for WebSocket monitoring.
+    
+    Returns:
+        {
+            "active_websockets": 5,
+            "total_conversations": 5,
+            "conversations_by_trip": {"trip1": 2, "trip2": 1, ...},
+            "uptime_seconds": 12345
+        }
+    """
+    # Extract trip IDs from connection IDs
+    conversations_by_trip = {}
+    for conn_id in websocket_conversation_histories.keys():
+        trip_id = conn_id.split("_")[0] if "_" in conn_id else "unknown"
+        conversations_by_trip[trip_id] = conversations_by_trip.get(trip_id, 0) + 1
+    
+    return {
+        "active_websockets": len(active_websocket_connections),
+        "total_conversations": len(websocket_conversation_histories),
+        "conversations_by_trip": conversations_by_trip,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+# ============================================================================
+# Error Handlers
+# ============================================================================
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     """Handle HTTP exceptions"""
