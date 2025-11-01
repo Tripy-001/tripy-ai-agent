@@ -41,28 +41,41 @@ def initialize_firebase_admin() -> None:
             # Try using Firestore credentials as fallback
             service_account_path = settings.FIRESTORE_CREDENTIALS
         
-        if not service_account_path:
-            logger.warning("[firebase-auth] No Firebase service account path configured")
-            logger.warning("[firebase-auth] Set FIREBASE_SERVICE_ACCOUNT_PATH or FIRESTORE_CREDENTIALS environment variable")
-            return
+        cred = None
         
-        # Expand path
-        service_account_path = os.path.expanduser(service_account_path)
-        if not os.path.isabs(service_account_path):
-            service_account_path = os.path.abspath(service_account_path)
+        # Try to load explicit credentials if path provided
+        if service_account_path:
+            # Expand path
+            service_account_path = os.path.expanduser(service_account_path)
+            if not os.path.isabs(service_account_path):
+                service_account_path = os.path.abspath(service_account_path)
+            
+            if os.path.exists(service_account_path):
+                try:
+                    # Initialize with explicit service account credentials
+                    cred = credentials.Certificate(service_account_path)
+                    logger.info(f"[firebase-auth] Using explicit service account: {service_account_path}")
+                except Exception as cred_err:
+                    logger.warning(f"[firebase-auth] Failed to load service account file; falling back to ADC: {str(cred_err)}")
+                    cred = None
+            else:
+                logger.warning(f"[firebase-auth] Service account file not found: {service_account_path}; falling back to ADC")
+        else:
+            logger.info("[firebase-auth] No service account path provided; using ADC (Application Default Credentials)")
         
-        if not os.path.exists(service_account_path):
-            logger.error(f"[firebase-auth] Service account file not found: {service_account_path}")
-            return
-        
-        # Initialize Firebase Admin SDK
-        cred = credentials.Certificate(service_account_path)
-        _firebase_app = firebase_admin.initialize_app(cred, {
-            'projectId': settings.FIRESTORE_PROJECT_ID or settings.GOOGLE_CLOUD_PROJECT,
-        })
+        # Initialize Firebase Admin SDK with explicit creds or ADC
+        if cred:
+            _firebase_app = firebase_admin.initialize_app(cred, {
+                'projectId': settings.FIRESTORE_PROJECT_ID or settings.GOOGLE_CLOUD_PROJECT,
+            })
+        else:
+            # Use Application Default Credentials (ADC) for Cloud Run/production
+            _firebase_app = firebase_admin.initialize_app(options={
+                'projectId': settings.FIRESTORE_PROJECT_ID or settings.GOOGLE_CLOUD_PROJECT,
+            })
+            logger.info("[firebase-auth] Using Application Default Credentials (ADC)")
         
         logger.info(f"[firebase-auth] Firebase Admin SDK initialized successfully")
-        logger.info(f"[firebase-auth] Using service account: {service_account_path}")
         
     except Exception as e:
         logger.error(f"[firebase-auth] Failed to initialize Firebase Admin SDK: {str(e)}")
