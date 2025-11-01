@@ -43,51 +43,90 @@ class ChatAssistantService:
         self.logger = logging.getLogger(__name__)
         
         # System prompt template for the AI assistant
-        self.base_system_prompt = """You are an expert AI travel assistant and agent helping users plan, optimize, and modify their trips.
+        self.base_system_prompt = """You are Tripy Guide, a friendly, energetic, and expert travel co-pilot for the Tripy platform. You are accompanying the user on their trip.
 
-Your role is to:
-- Answer questions about trip itineraries and travel plans with COMPLETE, DETAILED information
-- When asked about a specific day, provide ALL activities, restaurants, timings, and costs from that day
-- Provide personalized recommendations for activities, restaurants, and attractions
-- Offer local tips, cultural insights, and practical travel advice
-- Help with logistics like transportation, accommodation, and budgeting
-- MODIFY and EDIT existing trip plans when requested (change restaurants, add activities, swap locations, adjust schedules)
-- Suggest improvements and alternatives to make trips better
-- Share insider knowledge about destinations and hidden gems
+🚨 CRITICAL OUTPUT FORMAT RULE - READ THIS FIRST:
+**YOU MUST RESPOND IN PLAIN, NATURAL HUMAN TEXT ONLY.**
+**NEVER output JSON, code, data structures, or use curly braces { } or square brackets [ ] in your response.**
+**Your responses should read like a friendly conversation, NOT like computer code.**
 
-Editing Capabilities:
-- Change meals/restaurants (e.g., "change dinner on day 2 to Italian")
-- Replace activities (e.g., "swap the museum with outdoor hiking")
-- Add new activities or attractions
-- Remove activities they're not interested in
-- Adjust schedules and timing
-- Modify accommodation preferences
-- Update budget allocations
+❌ FORBIDDEN FORMATS (DO NOT USE THESE):
+- JSON objects: {"day": "...", "activities": [...]}
+- JSON arrays: [{}, {}, {}]
+- Code blocks: ```json or ```
+- Data structures with { } or [ ]
 
-RESPONSE FORMATTING RULES (CRITICAL):
-- Write in a natural, conversational tone like you're chatting with a friend
-- NO markdown formatting (no **, ##, -, etc.)
-- NO bullet points with symbols (•, *, -)
-- Use natural line breaks and spacing for readability
-- Use emojis sparingly and naturally (only when it feels conversational)
-- Break information into short, digestible paragraphs
-- Use plain text lists with numbers or simple commas
-- Example good format: "For breakfast, you'll visit Cafe Delight at 123 Main St. It's a cozy spot known for amazing pancakes and costs around $15 per person. After that, you're heading to..."
+✅ REQUIRED FORMAT (ALWAYS USE THIS):
+- Natural sentences with line breaks
+- Bullet points with • symbol
+- Emojis for visual sections (🌅 ☀️ 🌙 💰 💡)
+- Plain text that humans can read directly
+
+Example - If user asks "What's my plan for Day 3?":
+❌ WRONG: {"day_3": {"morning": [...], "afternoon": [...]}}
+✅ RIGHT: Day 3 - High Altitude Exploration\n\n🌅 Morning:\n• Cafe Amigos (7:45 AM, ₹300) - Quick breakfast
+
+Your Core Purpose:
+You are a conversational travel companion. Answer questions about trip itineraries with COMPLETE, DETAILED information in a friendly, natural format.
+
+RESPONSE FORMAT RULES (MANDATORY):
+
+For Itinerary/Day Queries:
+- Use SHORT, SCANNABLE bullet points (NOT paragraphs, NOT JSON)
+- MUST use actual line breaks between sections (blank lines for spacing)
+- Use actual emoji characters: 🌅 ☀️ 🌙 💰 💡 (not emoji codes)
+- Format each activity: "• Place Name (Time, ₹Cost) - Brief description"
+- Max 10-12 lines total per day query
+- Keep lines under 80 characters
+- Section headers: "🌅 Morning:", "☀️ Afternoon:", "🌙 Evening:"
+- Summary: "💰 Total: ₹X,XXX" and "💡 Tips: ..."
+- All costs in Indian Rupees (₹) - NEVER dollars ($)
+
+For General Questions:
+- Conversational but concise
+- Use natural language lists
+- Break into digestible chunks
+- Plain text with simple formatting
+
+Tone & Style:
+- Skip filler: NO "Oh fantastic!", "Let's walk through it", "sounds like"
+- Get straight to the point with essential information only
+- Friendly but efficient - like a knowledgeable travel buddy
+- Natural conversation, NOT technical output
+
+Format Example for Day Query:
+"Day 3 - High Altitude Exploration
+
+🌅 Morning:
+• Breakfast: Cafe Amigos (7:45 AM, ₹300) - Quick fuel before adventure
+• Gulaba Viewpoint (9 AM-12 PM, Free) - Breathtaking snow-capped peaks
+
+☀️ Afternoon:
+• Lunch: The Lazy Dog (1 PM, ₹600) - Popular leisurely spot
+• Nehru Kund (2:30-3:30 PM, Free) - Scenic beauty & relaxation
+
+🌙 Evening:
+• Sabali Cafe (5 PM, ₹200) - Cozy coffee & baked goods
+• Dinner: The Pahadi Cafe (7 PM, ₹700) - Authentic Himachali cuisine
+
+💰 Total: ₹3,600
+💡 Tips: Roads challenging at altitude, carry warm clothing, Rohtang may be closed"
 
 DETAIL REQUIREMENTS:
-- When asked about a day's activities, include EVERY activity from morning, afternoon, and evening
-- Include restaurant names, addresses, specialties, and costs
-- Include attraction names, what makes them special, and estimated time/cost
-- Provide context like "After breakfast at 9 AM, you'll head to..." or "For lunch around 1 PM, the plan is..."
-- Don't just summarize - give the full picture
+- Include: place name, timing, cost (₹), brief 1-line description
+- Give complete picture efficiently - NO vague summaries
+- Context must be factual from the trip data provided to you
+- REMEMBER: Trip context JSON is for YOUR reference only - users see friendly text responses
+
+🚨 FINAL REMINDER: If you ever feel tempted to output JSON, code, or technical formats - STOP. Rephrase as natural conversation instead.
 
 Guidelines:
-- Be friendly, helpful, and conversational like a professional travel agent chatting over coffee
-- Provide specific, actionable information with names, addresses, and costs
-- Consider the user's preferences, budget, and travel style in all suggestions
-- Keep responses conversational but informative
+- Be friendly but efficient - respect user's time and reading effort
+- Provide specific, actionable information with names and costs in ₹
+- Consider the user's preferences, budget, and travel style
+- Keep responses SHORT for itinerary queries, conversational for advice
 - Reference specific places and times from their itinerary
-- When suggesting changes, explain WHY it's better
+- When suggesting changes, explain WHY briefly (1 line)
 - Always confirm modifications before applying them
 - Provide alternatives when appropriate"""
     
@@ -135,16 +174,32 @@ Guidelines:
                 temperature=0.7
             )
             
-            # If the response is JSON, try to extract message
-            try:
-                response_data = json.loads(response_text)
-                if isinstance(response_data, dict) and "message" in response_data:
-                    response_text = response_data["message"]
-                elif isinstance(response_data, dict) and "response" in response_data:
-                    response_text = response_data["response"]
-            except json.JSONDecodeError:
-                # Response is plain text, use as-is
-                pass
+            # Try to extract text from JSON if AI returned JSON structure
+            if response_text.strip().startswith('{') or response_text.strip().startswith('['):
+                try:
+                    response_data = json.loads(response_text)
+                    
+                    # Try to extract human-readable message from common JSON fields
+                    if isinstance(response_data, dict):
+                        # Try common field names for message content
+                        for field in ['message', 'response', 'answer', 'text', 'content']:
+                            if field in response_data and isinstance(response_data[field], str):
+                                response_text = response_data[field]
+                                self.logger.info(f"[chat-assistant] Extracted message from JSON field: {field}")
+                                break
+                        else:
+                            # If no message field found, convert JSON to readable format
+                            self.logger.warning(f"[chat-assistant] AI returned JSON without message field, converting to text")
+                            response_text = self._convert_json_to_readable_text(response_data)
+                    
+                    elif isinstance(response_data, list):
+                        # If it's a list, try to format it as bullet points
+                        self.logger.warning(f"[chat-assistant] AI returned JSON array, converting to text")
+                        response_text = self._convert_json_to_readable_text(response_data)
+                        
+                except json.JSONDecodeError:
+                    # Not actually JSON, keep as-is
+                    pass
             
             if not response_text or response_text.strip() == "":
                 self.logger.warning("[chat-assistant] Empty response from Vertex AI")
@@ -193,7 +248,7 @@ Trip Context:
 - Travel Dates: {start_date} to {end_date}
 - Duration: {days} days
 - Group Size: {group_size} {'person' if group_size == 1 else 'people'}
-- Budget: ${budget}
+- Budget: ₹{budget}
 - Interests: {', '.join(interests) if interests else 'General travel'}
 - Travel Style: {trip_style}
 - Accommodation Type: {accommodation}
@@ -223,7 +278,7 @@ Trip Context:
                             duration = activity.get('duration_hours', 'N/A')
                             why = activity.get('why_recommended', '')
                             context_summary += f"    {idx}. {name} - {address}\n"
-                            context_summary += f"       Cost: ${cost}/person, Duration: {duration}hrs\n"
+                            context_summary += f"       Cost: ₹{cost}/person, Duration: {duration}hrs\n"
                             if why:
                                 context_summary += f"       Why: {why}\n"
                     
@@ -239,7 +294,7 @@ Trip Context:
                             duration = activity.get('duration_hours', 'N/A')
                             why = activity.get('why_recommended', '')
                             context_summary += f"    {idx}. {name} - {address}\n"
-                            context_summary += f"       Cost: ${cost}/person, Duration: {duration}hrs\n"
+                            context_summary += f"       Cost: ₹{cost}/person, Duration: {duration}hrs\n"
                             if why:
                                 context_summary += f"       Why: {why}\n"
                     
@@ -255,13 +310,13 @@ Trip Context:
                             duration = activity.get('duration_hours', 'N/A')
                             why = activity.get('why_recommended', '')
                             context_summary += f"    {idx}. {name} - {address}\n"
-                            context_summary += f"       Cost: ${cost}/person, Duration: {duration}hrs\n"
+                            context_summary += f"       Cost: ₹{cost}/person, Duration: {duration}hrs\n"
                             if why:
                                 context_summary += f"       Why: {why}\n"
                     
                     # Daily cost and notes
                     daily_cost = day.get('daily_total_cost', 'N/A')
-                    context_summary += f"  Total Day Cost: ${daily_cost}\n"
+                    context_summary += f"  Total Day Cost: ₹{daily_cost}\n"
                     
                     daily_notes = day.get('daily_notes', [])
                     if daily_notes:
@@ -359,8 +414,8 @@ Trip Context:
             destination = user_input.get('destination') or itinerary.get('destination', 'your destination')
             days = itinerary.get('trip_duration_days') or user_input.get('days', 'N/A')
             
-            welcome = f"👋 Hello! I'm your AI travel assistant for your {days}-day trip to {destination}. "
-            welcome += "I'm here to help you with:\n\n"
+            welcome = f"👋 Hello! I'm Tripy Guide, your travel companion for your {days}-day trip to {destination}. "
+            welcome += "I'll be staying along with you on this journey to help with:\n\n"
             welcome += "✈️ Questions about your itinerary\n"
             welcome += "🍽️ Restaurant and dining recommendations\n"
             welcome += "🎭 Activity and attraction suggestions\n"
@@ -373,7 +428,7 @@ Trip Context:
             
         except Exception as e:
             self.logger.error(f"[chat-assistant] Error generating welcome message: {str(e)}")
-            return "Hello! I'm your AI travel assistant. How can I help you with your trip today?"
+            return "Hello! I'm Tripy Guide, your travel companion. How can I help you with your trip today?"
     
     async def validate_trip_access(self, trip_id: str, user_id: str) -> tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
         """
@@ -510,3 +565,105 @@ Trip Context:
                 "success": False,
                 "error": f"Error processing modification: {str(e)}"
             }
+    
+    def _convert_json_to_readable_text(self, data: Any) -> str:
+        """
+        Convert JSON data structures to human-readable text format.
+        This is a fallback when AI returns JSON despite being told not to.
+        
+        Args:
+            data: JSON data (dict or list)
+        
+        Returns:
+            Human-readable formatted string
+        """
+        try:
+            if isinstance(data, dict):
+                # Handle day itinerary JSON structure
+                if 'morning' in data or 'afternoon' in data or 'evening' in data:
+                    result = []
+                    day_title = data.get('title', data.get('theme', 'Day Itinerary'))
+                    result.append(f"{day_title}\n")
+                    
+                    # Morning
+                    if 'morning' in data and data['morning']:
+                        result.append("🌅 Morning:")
+                        activities = data['morning'] if isinstance(data['morning'], list) else [data['morning']]
+                        for act in activities:
+                            if isinstance(act, dict):
+                                activity = act.get('activity', act.get('name', ''))
+                                desc = act.get('description', act.get('why', ''))
+                                result.append(f"• {activity} - {desc}" if desc else f"• {activity}")
+                            else:
+                                result.append(f"• {act}")
+                        result.append("")
+                    
+                    # Afternoon
+                    if 'afternoon' in data and data['afternoon']:
+                        result.append("☀️ Afternoon:")
+                        activities = data['afternoon'] if isinstance(data['afternoon'], list) else [data['afternoon']]
+                        for act in activities:
+                            if isinstance(act, dict):
+                                activity = act.get('activity', act.get('name', ''))
+                                desc = act.get('description', act.get('why', ''))
+                                result.append(f"• {activity} - {desc}" if desc else f"• {activity}")
+                            else:
+                                result.append(f"• {act}")
+                        result.append("")
+                    
+                    # Evening
+                    if 'evening' in data and data['evening']:
+                        result.append("🌙 Evening:")
+                        activities = data['evening'] if isinstance(data['evening'], list) else [data['evening']]
+                        for act in activities:
+                            if isinstance(act, dict):
+                                activity = act.get('activity', act.get('name', ''))
+                                desc = act.get('description', act.get('why', ''))
+                                result.append(f"• {activity} - {desc}" if desc else f"• {activity}")
+                            else:
+                                result.append(f"• {act}")
+                        result.append("")
+                    
+                    # Tips and cost
+                    if 'tips' in data:
+                        tips = data['tips'] if isinstance(data['tips'], list) else [data['tips']]
+                        result.append(f"💡 Tips: {', '.join(tips)}")
+                    
+                    if 'total_day_cost' in data:
+                        result.append(f"💰 Total: ₹{data['total_day_cost']}")
+                    
+                    return '\n'.join(result)
+                
+                # Generic dict handling
+                else:
+                    result = []
+                    for key, value in data.items():
+                        if isinstance(value, (dict, list)):
+                            result.append(f"{key.replace('_', ' ').title()}:")
+                            result.append(self._convert_json_to_readable_text(value))
+                        else:
+                            result.append(f"• {key.replace('_', ' ').title()}: {value}")
+                    return '\n'.join(result)
+            
+            elif isinstance(data, list):
+                # Handle list of items
+                result = []
+                for i, item in enumerate(data, 1):
+                    if isinstance(item, dict):
+                        # Try to extract meaningful fields
+                        if 'suggestion' in item or 'activity' in item or 'name' in item:
+                            title = item.get('suggestion', item.get('activity', item.get('name', f'Option {i}')))
+                            desc = item.get('description', item.get('details', ''))
+                            result.append(f"• {title}" + (f" - {desc}" if desc else ""))
+                        else:
+                            result.append(f"{i}. {self._convert_json_to_readable_text(item)}")
+                    else:
+                        result.append(f"• {item}")
+                return '\n'.join(result)
+            
+            else:
+                return str(data)
+                
+        except Exception as e:
+            self.logger.error(f"[chat-assistant] Error converting JSON to text: {e}")
+            return "I have the information, but I'm having trouble formatting it. Please try asking again."

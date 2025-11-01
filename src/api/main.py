@@ -1150,7 +1150,7 @@ async def websocket_chat_endpoint(
     token: str = Query(...)
 ):
     """
-    WebSocket endpoint for AI travel assistant chat.
+    WebSocket endpoint for Tripy Guide chat assistant.
     
     Provides real-time conversational assistance for trip planning.
     
