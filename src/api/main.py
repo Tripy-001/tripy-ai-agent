@@ -48,11 +48,22 @@ app = FastAPI(
 # Add middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=[
+        "https://tripy-ai-planner.vercel.app",  # Production frontend
+        "http://localhost:3000",                 # Local dev
+        "http://localhost:3001",                 # Alternative local port
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# WebSocket allowed origins (for explicit origin checking)
+ALLOWED_WS_ORIGINS = {
+    "https://tripy-ai-planner.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+}
 
 app.add_middleware(
     TrustedHostMiddleware,
@@ -1223,6 +1234,13 @@ async def websocket_chat_endpoint(
             await websocket.close(code=1011, reason="Authentication service unavailable")
             return
         
+        # Step 0: Check origin (IMPORTANT for Cloud Run production)
+        origin = websocket.headers.get("origin")
+        if origin and origin not in ALLOWED_WS_ORIGINS:
+            logger.warning(f"[ws] Rejected connection from unauthorized origin: {origin}")
+            await websocket.close(code=1008, reason="Origin not allowed")
+            return
+        
         # Step 1: Verify Firebase token
         try:
             decoded_token = await verify_firebase_token(token)
@@ -1247,12 +1265,14 @@ async def websocket_chat_endpoint(
         
         # Step 3: Accept WebSocket connection
         await websocket.accept()
+        
+        # IMPORTANT: Store connection AFTER accepting
         active_websocket_connections[connection_id] = websocket
         websocket_conversation_histories[connection_id] = []
         
         logger.info(f"[ws] Connected: {connection_id}")
         
-        # Step 4: Send welcome message
+        # Step 4: Send welcome message (connection is now ready)
         try:
             welcome_msg = await chat_assistant.get_welcome_message(trip_context)
             await websocket.send_json({
@@ -1261,7 +1281,7 @@ async def websocket_chat_endpoint(
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             })
         except Exception as e:
-            logger.error(f"[ws] Welcome message failed: {str(e)}")
+            logger.error(f"[ws] Welcome message failed: {str(e)}", exc_info=True)
         
         # Step 5: Message loop
         while True:
