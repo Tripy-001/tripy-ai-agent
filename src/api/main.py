@@ -322,98 +322,186 @@ async def generate_trip_plan(
             logger.exception("[generate-trip] Geocoding pre-check error")
             raise HTTPException(status_code=502, detail=f"Geocoding pre-check error: {str(geo_e)}")
 
-        # Legacy path: synchronous generation & return TripPlanResponse
-        if not is_proxy_flow or not (get_settings().USE_FIRESTORE and fs_manager is not None):
-            # Generate trip synchronously (legacy behavior)
-            logger.info("[generate-trip] Starting itinerary generation (legacy)", extra={"trip_id": trip_id})
-            trip_response = await itinerary_generator.generate_comprehensive_plan(req, trip_id)
+        # ALWAYS use background processing for parallel request handling
+        # Create/update Firestore doc with processing status immediately
+        settings = get_settings()
+        use_firestore = settings.USE_FIRESTORE and fs_manager is not None
+        
+        if use_firestore:
             try:
-                settings = get_settings()
-                if settings.USE_FIRESTORE and fs_manager is not None:
-                    response_data: Dict[str, Any] = trip_response.model_dump(mode="json")
-                    request_data: Dict[str, Any] = req.model_dump(mode="json")
-                    # Persist flat itinerary JSON at root doc; no daywise subcollections
-                    doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
-                    # Merge to avoid clobbering fields the frontend may have already set
+                doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
+                request_data: Dict[str, Any] = req.model_dump(mode="json")
+                
+                # Create or update with processing status
+                if is_proxy_flow:
+                    # Frontend already created placeholder, just update status
+                    doc_ref.update({
+                        "status": "processing",
+                        "progress": 5,
+                        "updatedAt": gcf.SERVER_TIMESTAMP
+                    })
+                else:
+                    # Create new document with initial data
                     doc_ref.set({
-                        "status": "completed",
+                        "status": "processing",
+                        "progress": 5,
                         "request": request_data,
-                        "itinerary": response_data,
+                        "itinerary": None,
                         "error": None,
-                        "updatedAt": gcf.SERVER_TIMESTAMP,
                         "createdAt": gcf.SERVER_TIMESTAMP,
+                        "updatedAt": gcf.SERVER_TIMESTAMP,
                     }, merge=True)
                     
-                    # Enrich regular trip with photos in background
-                    background_tasks.add_task(_enrich_trip_with_photos, trip_id, False)
-                    
-                    # Also create/update a public copy of the trip (non-blocking)
-                    try:
-                        await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
-                        # Enrich public trip with photos in background (uses same trip_id)
-                        background_tasks.add_task(_enrich_trip_with_photos, trip_id, True)
-                    except Exception as pub_e:
-                        logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
-            except Exception as persist_e:
-                logger.warning("Trip persistence to Firestore failed (non-blocking)", extra={"trip_id": trip_id, "error": str(persist_e)})
-            return trip_response
+                logger.info(f"[generate-trip] Created processing status for trip {trip_id}")
+            except Exception as fe:
+                logger.warning(f"[generate-trip] Firestore init failed for {trip_id}: {fe}")
+                # Continue anyway - background task will handle it
 
-        # Proxy flow: update Firestore to processing and schedule background generation, return 202
-        try:
-            doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(trip_id)
-            doc_ref.update({
-                "status": "processing",
-                "updatedAt": gcf.SERVER_TIMESTAMP
-            })
-        except Exception as fe:
-            logger.warning("[generate-trip] Firestore status update to processing failed", extra={"trip_id": trip_id, "error": str(fe)})
-
+        # Background task to generate trip asynchronously
         async def run_generation_and_update():
+            """Execute trip generation in background without blocking the API response"""
+            local_trip_id = trip_id  # Capture in closure
+            local_req = req
+            local_use_firestore = use_firestore
+            
             try:
-                trip_response = await itinerary_generator.generate_comprehensive_plan(req, trip_id)
-                itinerary_json: Dict[str, Any] = trip_response.model_dump(mode="json")
-                try:
-                    doc_ref.update({
-                        "status": "completed",
-                        "itinerary": itinerary_json,
-                        "error": None,
-                        "updatedAt": gcf.SERVER_TIMESTAMP
-                    })
-                    logger.info("[generate-trip] Firestore updated to completed", extra={"trip_id": trip_id})
-                    
-                    # Enrich regular trip with photos
-                    background_tasks.add_task(_enrich_trip_with_photos, trip_id, False)
-                    
-                    # Save public copy as well (non-blocking) and enrich
+                logger.info(f"[bg-gen] Starting generation for trip {local_trip_id}")
+                
+                # Update progress: generating itinerary
+                if local_use_firestore:
                     try:
-                        await itinerary_generator.create_and_save_public_trip(trip_response, req, fs_manager)
-                        # Enrich public trip with photos (uses same trip_id)
-                        background_tasks.add_task(_enrich_trip_with_photos, trip_id, True)
-                    except Exception as pub_e:
-                        logger.warning("Public trip save/enrich failed (non-blocking)", extra={"trip_id": trip_id, "error": str(pub_e)})
-                except Exception as ue:
-                    logger.error("[generate-trip] Firestore completion update failed", extra={"trip_id": trip_id, "error": str(ue)})
+                        doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(local_trip_id)
+                        doc_ref.update({
+                            "status": "generating_itinerary",
+                            "progress": 20,
+                            "updatedAt": gcf.SERVER_TIMESTAMP
+                        })
+                    except Exception as e:
+                        logger.warning(f"[bg-gen] Progress update failed: {e}")
+                
+                # Generate comprehensive plan
+                trip_response = await itinerary_generator.generate_comprehensive_plan(local_req, local_trip_id)
+                itinerary_json: Dict[str, Any] = trip_response.model_dump(mode="json")
+                request_json: Dict[str, Any] = local_req.model_dump(mode="json")
+                
+                logger.info(f"[bg-gen] Generation completed for trip {local_trip_id}")
+                
+                # Update Firestore with completed status
+                if local_use_firestore:
+                    try:
+                        doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(local_trip_id)
+                        doc_ref.update({
+                            "status": "completed",
+                            "progress": 100,
+                            "request": request_json,
+                            "itinerary": itinerary_json,
+                            "error": None,
+                            "updatedAt": gcf.SERVER_TIMESTAMP,
+                            "completedAt": gcf.SERVER_TIMESTAMP
+                        })
+                        logger.info(f"[bg-gen] Firestore updated to completed for {local_trip_id}")
+                        
+                        # Schedule photo enrichment (non-blocking, best-effort)
+                        try:
+                            await _enrich_trip_with_photos(local_trip_id, False)
+                        except Exception as photo_e:
+                            logger.warning(f"[bg-gen] Photo enrichment failed for {local_trip_id}: {photo_e}")
+                        
+                        # Create public trip copy (non-blocking, best-effort)
+                        try:
+                            await itinerary_generator.create_and_save_public_trip(trip_response, local_req, fs_manager)
+                            # Enrich public trip with photos
+                            await _enrich_trip_with_photos(local_trip_id, True)
+                        except Exception as pub_e:
+                            logger.warning(f"[bg-gen] Public trip save/enrich failed for {local_trip_id}: {pub_e}")
+                            
+                    except Exception as update_e:
+                        logger.error(f"[bg-gen] Firestore completion update failed for {local_trip_id}: {update_e}")
+                        
             except Exception as gen_e:
-                logger.exception("[generate-trip] Background generation failed")
-                try:
-                    doc_ref.update({
-                        "status": "failed",
-                        "error": str(gen_e),
-                        "updatedAt": gcf.SERVER_TIMESTAMP
-                    })
-                except Exception as ue2:
-                    logger.error("[generate-trip] Firestore failure update failed", extra={"trip_id": trip_id, "error": str(ue2)})
+                logger.exception(f"[bg-gen] Generation failed for trip {local_trip_id}: {gen_e}")
+                
+                # Update Firestore with failed status
+                if local_use_firestore:
+                    try:
+                        doc_ref = fs_manager.client.collection(fs_manager.collection_name).document(local_trip_id)
+                        doc_ref.update({
+                            "status": "failed",
+                            "progress": 0,
+                            "error": str(gen_e),
+                            "updatedAt": gcf.SERVER_TIMESTAMP
+                        })
+                    except Exception as fail_update_e:
+                        logger.error(f"[bg-gen] Failed to update error status for {local_trip_id}: {fail_update_e}")
 
-        # Schedule background task
+        # Add background task - returns immediately
         background_tasks.add_task(run_generation_and_update)
-
-        return JSONResponse(status_code=202, content={"tripId": trip_id, "status": "processing"})
+        
+        # Return 202 Accepted with trip ID for status polling
+        return JSONResponse(
+            status_code=202,
+            content={
+                "tripId": trip_id,
+                "status": "processing",
+                "message": "Trip generation started. Poll /api/v1/trips/{tripId}/status for updates.",
+                "statusUrl": f"/api/v1/trips/{trip_id}/status"
+            }
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error generating trip plan: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating trip plan: {str(e)}")
+
+@app.get("/api/v1/trips/{trip_id}/status")
+async def get_trip_status(trip_id: str):
+    """
+    Get trip generation status for polling.
+    
+    Returns status and progress information for async trip generation.
+    Frontend should poll this endpoint until status is 'completed' or 'failed'.
+    """
+    try:
+        logger.info(f"[status] Checking status for trip {trip_id}")
+        
+        settings = get_settings()
+        if not (settings.USE_FIRESTORE and fs_manager is not None):
+            raise HTTPException(status_code=503, detail="Status tracking not available (Firestore disabled)")
+        
+        trip_doc = fs_manager.client.collection(fs_manager.collection_name).document(trip_id).get()
+        
+        if not trip_doc.exists:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        
+        trip_data = trip_doc.to_dict()
+        status = trip_data.get("status", "unknown")
+        progress = trip_data.get("progress", 0)
+        error = trip_data.get("error")
+        itinerary = trip_data.get("itinerary")
+        
+        response = {
+            "tripId": trip_id,
+            "status": status,
+            "progress": progress,
+            "createdAt": trip_data.get("createdAt"),
+            "updatedAt": trip_data.get("updatedAt")
+        }
+        
+        if status == "completed":
+            response["completedAt"] = trip_data.get("completedAt")
+            response["itinerary"] = itinerary
+        elif status == "failed":
+            response["error"] = error
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[status] Error getting trip status {trip_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/v1/trip/{trip_id}", response_model=TripPlanResponse)
 async def get_trip_plan(trip_id: str):
