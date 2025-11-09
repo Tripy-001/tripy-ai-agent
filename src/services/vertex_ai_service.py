@@ -235,11 +235,7 @@ class VertexAIService:
                             "evening":   { "activities": [ /* same shape as morning.activities; include dinner as a meal activity when appropriate */ ], "estimated_cost": "number", "total_duration_hours": "number", "transportation_notes": "string" },
 
                             "daily_total_cost": "number",
-                            "daily_notes": ["string"],
-                            "alternative_options": {
-                                "attractions": [ /* 1–2 PlaceResponse objects (same shape as morning.activities) */ ],
-                                "meals": [ /* 1–2 PlaceResponse objects (restaurants/cafes; same shape as morning.activities) */ ]
-                            },
+                            "daily_notes": ["string"]
                         }
                     ],
 
@@ -272,17 +268,8 @@ class VertexAIService:
                     },
 
                     "map_data": {
-                        "static_map_url": "string",
                         "interactive_map_embed_url": "string",
-                        "all_locations": [
-                            {
-                                "place_id": "string (from provided places_data)",
-                                "name": "string",
-                                "coordinates": { "lat": "number", "lng": "number" }
-                            }
-                        ],
-                        "daily_route_maps": { "Day 1": "https://...", "Day 2": "https://..." },
-                        "walking_distances": { "string": { "string": "number" } }
+                        "daily_route_maps": { "Day 1": "https://...", "Day 2": "https://..." }
                     },
 
                     "local_information": {
@@ -333,7 +320,6 @@ class VertexAIService:
                                                                 - Use ONLY the provided place data (places_data) and their real place_id values. Do not invent place_ids. Never output placeholders like "generic_*" or activities without a valid place_id and coordinates.
                                                                 - Do not include any photo fields. Photos are not part of the schema.
                                                                 - Keep strings concise: descriptions and why_recommended should be under 200 characters each.
-                                                                - Alternatives per day: provide at most 2 attractions and at most 2 meals in `alternative_options`.
                                                                 - Daily activities must be concise and PLACE-ONLY:
                                                                     - Include only real places such as tourist attractions, viewpoints, museums, cultural centers, gardens/parks, markets/shops, restaurants, or cafes.
                                                                     - Do NOT include transport or accommodation as activities. Travel and hotel check-in/out should be reflected in descriptions/notes, not as separate activities.
@@ -347,18 +333,12 @@ class VertexAIService:
                                                                     - Prefer higher-quality dining: when data exists, select restaurants/cafes with rating >= 4.2 and user_ratings_total >= 300; otherwise choose the best available in places_data.
                                                                     - Use must_try_cuisines and dietary_restrictions to diversify meal choices across days; mention signature dishes in why_recommended when relevant.
                                                                 - Represent meals (breakfast, lunch, dinner) as activities within the appropriate blocks, using restaurants or cafes from places_data with real place_ids. Use activity_type="meal" and estimate costs per person in the specified currency. Include rating and user_ratings_total in PlaceResponse when available.
-                                                                - Provide structured daily alternatives (STRICT & CONSISTENT):
-                                                                    - alternative_options.attractions: 1-2 items (at least 1; never null), each a full PlaceResponse with EXACTLY the same schema as used for the main morning.activities object (no extra/missing fields), and include why_recommended.
-                                                                    - alternative_options.meals: 1-2 items (at least 1; never null), each a full PlaceResponse (restaurant/cafe) with EXACTLY the same schema as morning.activities (no extra/missing fields), and include cuisine context in description/why_recommended.
-                                                                    - If options are scarce, you may repeat suitable places to ensure the minimum counts are met; prefer unique entries when possible.
-                                                                    - All alternative entries MUST reference real place_id values from places_data and include coordinates; do not return strings or placeholders.
                                                                 - Cost accuracy and currency rules (STRICT):
                                                                     - All cost fields MUST be numbers (no strings), in the specified currency. Do NOT output ranges (e.g., "10-20"), vague terms ("~", "approx", "varies", "TBD"), or currency symbols within the number. Use the separate currency field for currency.
                                                                     - Activity costs: estimated_cost_per_person is per traveler; group_cost should equal estimated_cost_per_person * group_size (rounded sensibly). Use 0 only when something is genuinely free (e.g., walking, free museum day).
                                                                     - Daily and overall budgets: daily_total_cost and budget_breakdown values must be numerically consistent (the totals should align within about 10%).
                                                                     - Transportation costs: provide numeric values wherever a mode is specified (airport_transfers, daily_transport_costs). Estimate based on realistic local pricing for the destination; avoid null unless truly unknown and then provide a brief note in "notes".
                                                                     - Travel options and legs: always provide numeric estimated_cost values that make sense for the distance/mode and the budget tier; avoid placeholders.
-                                                                - For each primary activity, prefer 1–2 alternatives drawn from provided data when possible.
                                                                 - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation, accommodations, and the travel_options array.
                                                                 - Travel options rules (popular/common routes, budget-tiered alternatives):
                                                                     - Provide 2–3 alternatives ordered by typical budget bands (Budget, Value, Comfort).
@@ -373,10 +353,7 @@ class VertexAIService:
                                                                     - On the last day, include realistic wrap-up activities only if time permits before departure.
                                                                 - Where an object is required (e.g., transportation sections), do NOT return plain strings; if you only have descriptive text, wrap it in an object under a "notes" field.
                                                                 - Map data formatting (STRICT):
-                                                                    - "map_data.all_locations" MUST be an array of objects and each object MUST contain exactly these fields: "place_id" (must be a real id from places_data), "name", and "coordinates" with numeric "lat" and "lng". Do not add extra fields in these objects.
-                                                                    - "map_data.static_map_url" MUST be a single HTTPS Google Maps URL that shows ONLY the destination center (no directions). If API-key parameters are unknown, use a valid public format like "https://www.google.com/maps/search/?api=1&query={lat},{lng}" using the destination’s coordinates. Do not leave this empty or as a placeholder.
-                                                                    - "map_data.interactive_map_embed_url" MUST be a single HTTPS Google Maps embed or maps URL focused on the destination center (no directions), such as "https://www.google.com/maps?q={lat},{lng}" or an embed form. Do not leave this empty or as a placeholder.
-                                                                    - These two URLs are destination-level only (overview maps). Do not put daily route directions here; daily routes belong in "map_data.daily_route_maps".
+                                                                    - "map_data.interactive_map_embed_url" MUST be a single valid HTTPS Google Maps URL focused on the destination center in this exact format: "https://www.google.com/maps/search/?api=1&query={destination_name}" where {destination_name} is the URL-encoded destination city name. For example, for "Munnar" use "https://www.google.com/maps/search/?api=1&query=Munnar". Do not use coordinates, place IDs, or embed URLs. Keep it consistent every time.
                                                                     - "map_data.daily_route_maps" MUST include an entry for EVERY day in daily_itineraries with key "Day {day_number}".
                                                                     - Each value MUST be a single HTTPS URL (matching ^https://) to a route map that sequences ALL locations visited that day in order (morning → afternoon → evening; include meal stops). Never output placeholders like "Day 1 map", "[route]", or descriptive text without a URL.
                                                                     - Build the route using ONLY places from places_data and their coordinates. If fewer than 2 locations with coordinates exist on a day, return a valid static map URL showing the available point(s) rather than a placeholder.
@@ -429,7 +406,7 @@ class VertexAIService:
         - Create a logical daily flow that considers travel time between locations; put connective logic in each activity's description.
         - Include practical tips, local customs, and cultural insights for {request.destination}.
         - Emphasize a rhythmic daily flow—breakfast → explore → lunch → explore → evening wind-down → dinner—with meals chosen from places_data, favoring high ratings and strong review counts; vary cuisines using must_try_cuisines and don’t repeat restaurants.
-        - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary, including all alternatives, is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
+        - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
         """
 
     def _compact_places_data(self, places_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -798,11 +775,8 @@ class VertexAIService:
                 "recommended_apps": []
             },
             "map_data": {
-                "static_map_url": "",
                 "interactive_map_embed_url": "",
-                "all_locations": [],
-                "daily_route_maps": {},
-                "walking_distances": {}
+                "daily_route_maps": {}
             },
             "local_information": {
                 "currency_info": {},

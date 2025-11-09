@@ -80,8 +80,6 @@ class DayItineraryResponse(BaseModel):
     
     daily_total_cost: Decimal
     daily_notes: List[str] = Field(default_factory=list)
-    alternative_options: Dict[str, List[PlaceResponse]] = Field(default_factory=dict)
-    weather_alternatives: Dict[str, List[PlaceResponse]] = Field(default_factory=dict)
 
 class AccommodationResponse(BaseModel):
     primary_recommendation: PlaceResponse
@@ -109,11 +107,8 @@ class BudgetBreakdownResponse(BaseModel):
     budget_tips: List[str] = Field(default_factory=list)
 
 class MapDataResponse(BaseModel):
-    static_map_url: str
     interactive_map_embed_url: str
-    all_locations: List[Dict[str, Any]] = Field(default_factory=list)
     daily_route_maps: Dict[str, str] = Field(default_factory=dict)  # day -> map_url
-    walking_distances: Dict[str, Dict[str, float]] = Field(default_factory=dict)
 
 class LocalInformationResponse(BaseModel):
     currency_info: Dict[str, Any]
