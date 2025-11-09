@@ -48,8 +48,13 @@ class Settings(BaseSettings):
     REQUEST_TIMEOUT_SECONDS: int = 300
 
     # Prompt sizing controls
-    MAX_PROMPT_PLACES_CHARS: int = 20000  # budget for compact places JSON in prompt
+    MAX_PROMPT_PLACES_CHARS: int = 25000  # Increased for better context, managed by token budget
     MAX_PLACE_ENTRY_CHARS: int = 700      # skip oversized place entries when compacting
+    
+    # Progressive generation settings (for long trips)
+    PROGRESSIVE_GENERATION_THRESHOLD_DAYS: int = 7  # Use progressive for trips > 7 days
+    DAYS_PER_GENERATION_CHUNK: int = 5  # Generate 5 days at a time for long trips
+    MAX_RETRIES_PER_CHUNK: int = 2  # Retry failed chunks twice
 
     # Admin controls
     ADMIN_API_TOKEN: Optional[str] = None  # simple bearer token for admin-only endpoints

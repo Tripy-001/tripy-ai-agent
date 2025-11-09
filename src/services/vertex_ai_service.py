@@ -25,7 +25,11 @@ class VertexAIService:
             raise
     
     def generate_trip_plan(self, request: TripPlanRequest, places_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate trip plan using Gemini Flash model"""
+        """Generate trip plan using Gemini Flash model
+        
+        Note: For trips longer than 7 days, use ProgressiveItineraryGenerator instead
+        to avoid token exhaustion. This method is optimized for short-medium trips.
+        """
         
         try:
             self.logger.debug("[vertex] generate_trip_plan called")
@@ -51,17 +55,27 @@ class VertexAIService:
 
             user_prompt = self._build_user_prompt(request, places_data, compact_places=compact_places)
             # Prompt diagnostics (sizes only)
+            trip_duration = (request.end_date - request.start_date).days
             self.logger.debug(
                 "[vertex] prompt sizes",
                 extra={
                     "system_len": len(system_prompt or ""),
                     "user_len": len(user_prompt or ""),
                     "destination": request.destination,
+                    "trip_duration": trip_duration,
                     "group_size": request.group_size,
                     "style": str(request.primary_travel_style),
                     "activity": str(request.activity_level)
                 }
             )
+            
+            # Warn if trip is too long for single-shot generation
+            if trip_duration > 7:
+                self.logger.warning(
+                    f"[vertex] Generating {trip_duration}-day trip in single shot may exceed token limits. "
+                    "Consider using ProgressiveItineraryGenerator for trips > 7 days."
+                )
+            
             # Full user prompt at debug for inspection
             self.logger.debug("[vertex] user prompt\n%s", user_prompt)
             

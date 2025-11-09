@@ -7,6 +7,7 @@ from src.models.response_models import TripPlanResponse
 from src.services.vertex_ai_service import VertexAIService
 from src.services.google_places_service import GooglePlacesService
 from src.services.travel_service import TravelService
+from src.services.progressive_itinerary_generator import ProgressiveItineraryGenerator
 import json
 
 class ItineraryGeneratorService:
@@ -15,11 +16,22 @@ class ItineraryGeneratorService:
         self.places_service = places_service
         self.travel_service = travel_service or TravelService()
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize progressive generator for long trips
+        self.progressive_generator = ProgressiveItineraryGenerator(
+            vertex_ai_service=vertex_ai_service,
+            places_service=places_service,
+            travel_service=self.travel_service
+        )
     
     async def generate_comprehensive_plan(self, request: TripPlanRequest, trip_id: str) -> TripPlanResponse:
-        """Generate a comprehensive trip plan using Vertex AI and Google Places data"""
+        """Generate a comprehensive trip plan using Vertex AI and Google Places data
+        
+        Uses progressive generation for trips longer than 7 days to avoid token exhaustion.
+        """
         
         start_time = datetime.utcnow()
+        trip_duration = (request.end_date - request.start_date).days
         
         try:
             self.logger.info(
@@ -28,105 +40,27 @@ class ItineraryGeneratorService:
                     "trip_id": trip_id,
                     "destination": request.destination,
                     "dates": f"{request.start_date} to {request.end_date}",
+                    "duration": trip_duration,
                     "group_size": request.group_size,
                     "budget": request.total_budget,
                     "currency": request.budget_currency
                 }
             )
             
-            # Step 1: Fetch places data from Google Places API
-            self.logger.info("[itinerary] Fetching places data (Places API)")
-            places_data = await self.places_service.fetch_all_places_for_trip(request)
-            self.logger.debug(
-                "[itinerary] Places data fetched",
+            # Delegate to progressive generator (handles both short and long trips)
+            trip_response = await self.progressive_generator.generate_comprehensive_plan(request, trip_id)
+            
+            self.logger.info(
+                "[itinerary] Trip plan completed successfully",
                 extra={
-                    "categories": list(places_data.keys()) if isinstance(places_data, dict) else None,
-                    "non_empty_categories": [k for k, v in (places_data or {}).items() if v]
+                    "trip_id": trip_id,
+                    "generation_time_s": round((datetime.utcnow() - start_time).total_seconds(), 2),
+                    "days": trip_response.trip_duration_days,
+                    "itineraries_count": len(trip_response.daily_itineraries or [])
                 }
             )
-            if not places_data or not any(places_data.values()):
-                raise ValueError("No places found for the specified destination")
             
-            # Step 2: Fetch travel-to-destination options
-            try:
-                origin = request.origin
-                travel_options = self.travel_service.fetch_travel_options(
-                    origin=origin,
-                    destination=request.destination,
-                    total_budget=float(request.total_budget),
-                    currency=request.budget_currency,
-                    group_size=int(request.group_size)
-                )
-                places_data["travel_to_destination"] = travel_options
-            except Exception as travel_err:
-                self.logger.warning("[itinerary] Travel options fetch failed", extra={"error": str(travel_err)})
-                places_data["travel_to_destination"] = []
-
-            api_calls_made = self.places_service.get_api_calls_made()
-            self.logger.info("[itinerary] Places data ready", extra={"api_calls": api_calls_made})
-            
-            # Step 3: Generate trip plan using Vertex AI Gemini Flash
-            self.logger.info("[itinerary] Invoking Vertex model for trip plan")
-            trip_data = self.vertex_ai_service.generate_trip_plan(request, places_data)
-            self.logger.debug(
-                "[itinerary] Vertex raw trip data received",
-                extra={"type": type(trip_data).__name__, "keys": list(trip_data.keys())[:15] if isinstance(trip_data, dict) else None}
-            )
-
-            # Step 4: Add metadata and validation
-            trip_data["trip_id"] = trip_id
-            trip_data["generated_at"] = start_time.isoformat()
-            trip_data["last_updated"] = datetime.utcnow().isoformat()
-            # Ensure required fields expected by TripPlanResponse are present
-            trip_data["origin"] = request.origin
-            
-            # Step 5: Calculate generation time and performance metrics
-            generation_time = (datetime.utcnow() - start_time).total_seconds()
-            trip_data["generation_time_seconds"] = generation_time
-            trip_data["places_api_calls"] = api_calls_made
-            
-            # Ensure accommodation primary recommendation references a real fetched place
-            try:
-                acc_candidates: List[Dict[str, Any]] = places_data.get("accommodations") or []
-                trip_data = self._enforce_accommodation_from_candidates(trip_data, acc_candidates, request)
-            except Exception as acc_fix_err:
-                self.logger.warning("[itinerary] Accommodation enforcement skipped", extra={"error": str(acc_fix_err)})
-
-            # Inject travel_options directly to the final response payload for validation
-            try:
-                if isinstance(trip_data, dict):
-                    trip_data.setdefault("travel_options", [])
-                    # If model returned an internal suggestion via places_data, prefer AI's structured response if present; otherwise, fallback to fetched options
-                    if not trip_data.get("travel_options"):
-                        trip_data["travel_options"] = places_data.get("travel_to_destination", [])
-            except Exception:
-                pass
-
-            # Step 6: (removed) No photo fields to sanitize
-
-            # Step 7: Validate and create response model directly against TripPlanResponse
-            try:
-                # Minimal sanitation to handle common minor shape mismatches
-                if isinstance(trip_data, dict):
-                    trip_data = self._sanitize_trip_data(trip_data)
-                    # Ensure daily_route_maps has valid HTTPS URLs for every day
-                    trip_data = self._ensure_daily_route_maps(trip_data)
-                trip_response = TripPlanResponse(**trip_data)
-                self.logger.info(
-                    "[itinerary] Trip plan validated and created",
-                    extra={
-                        "trip_id": trip_id,
-                        "generation_time_s": round(generation_time, 2),
-                        "days": trip_response.trip_duration_days,
-                        "itineraries_count": len(trip_response.daily_itineraries or [])
-                    }
-                )
-                return trip_response
-                
-            except Exception as validation_error:
-                self.logger.error("[itinerary] Validation error", extra={"error": str(validation_error)})
-                # Return a minimal valid response
-                return self._create_minimal_response(request, trip_id, str(validation_error))
+            return trip_response
             
         except Exception as e:
             self.logger.error("[itinerary] Error during generation", extra={"error": str(e)})
