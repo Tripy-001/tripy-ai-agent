@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from google.cloud import firestore as gcf
 import json
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import functools
 
 from src.models.request_models import TripPlanRequest, VoiceEditRequest, VoiceEditResponse, EditSuggestionsResponse
 from src.models.response_models import TripPlanResponse
@@ -86,6 +88,10 @@ active_websocket_connections: Dict[str, WebSocket] = {}
 websocket_conversation_histories: Dict[str, List[dict]] = {}
 websocket_rate_limits: Dict[str, List[datetime]] = defaultdict(list)
 
+# Thread pool for blocking operations (trip generation, LLM calls)
+# This prevents long-running tasks from blocking the event loop
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trip_gen")
+
 # Rate limiting config
 MAX_MESSAGES_PER_MINUTE = 10
 WEBSOCKET_TIMEOUT_SECONDS = 300  # 5 minutes
@@ -157,8 +163,22 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on shutdown"""
-    # No SQL resources to close
-    return
+    global executor
+    
+    # Shutdown thread pool executor gracefully
+    if executor:
+        logger.info("Shutting down thread pool executor...")
+        executor.shutdown(wait=True, cancel_futures=False)
+        logger.info("Thread pool executor shut down successfully")
+    
+    # Close any remaining WebSocket connections
+    for conn_id, ws in list(active_websocket_connections.items()):
+        try:
+            await ws.close(code=1001, reason="Server shutting down")
+        except Exception:
+            pass
+    
+    logger.info("Shutdown complete")
 
 # Dependency to get services
 def get_services():
@@ -357,9 +377,10 @@ async def generate_trip_plan(
                 logger.warning(f"[generate-trip] Firestore init failed for {trip_id}: {fe}")
                 # Continue anyway - background task will handle it
 
-        # Background task to generate trip asynchronously
+        # Background task to generate trip asynchronously IN THREAD POOL
+        # This prevents blocking the event loop so WebSocket connections can be handled
         async def run_generation_and_update():
-            """Execute trip generation in background without blocking the API response"""
+            """Execute trip generation in thread pool without blocking the event loop"""
             local_trip_id = trip_id  # Capture in closure
             local_req = req
             local_use_firestore = use_firestore
@@ -379,8 +400,17 @@ async def generate_trip_plan(
                     except Exception as e:
                         logger.warning(f"[bg-gen] Progress update failed: {e}")
                 
-                # Generate comprehensive plan
-                trip_response = await itinerary_generator.generate_comprehensive_plan(local_req, local_trip_id)
+                # Run generation in thread pool to avoid blocking event loop
+                # This allows WebSocket connections and other async operations to continue
+                loop = asyncio.get_event_loop()
+                trip_response = await loop.run_in_executor(
+                    executor,
+                    functools.partial(
+                        asyncio.run,
+                        itinerary_generator.generate_comprehensive_plan(local_req, local_trip_id)
+                    )
+                )
+                
                 itinerary_json: Dict[str, Any] = trip_response.model_dump(mode="json")
                 request_json: Dict[str, Any] = local_req.model_dump(mode="json")
                 

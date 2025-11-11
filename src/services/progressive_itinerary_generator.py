@@ -500,15 +500,16 @@ class ProgressiveItineraryGenerator:
         
         for attempt in range(max_retries):
             try:
-                # Build minimal prompt for overview generation
+                # Build comprehensive prompt for overview generation
                 prompt = f"""Generate trip overview JSON for:
+Origin: {request.origin}
 Destination: {request.destination}
 Duration: {(request.end_date - request.start_date).days} days
 Budget: {request.total_budget} {request.budget_currency}
 Group: {request.group_size} people
 Style: {request.primary_travel_style}
 
-Return JSON with ONLY these fields:
+Return JSON with ALL these fields:
 {{
     "accommodations": {{
         "primary_recommendation": <PlaceResponse from provided accommodations>,
@@ -519,12 +520,55 @@ Return JSON with ONLY these fields:
     "transportation": {{
         "airport_transfers": {{"arrival": {{"mode": "...", "estimated_cost": 0}}, "departure": {{"mode": "...", "estimated_cost": 0}}}},
         "local_transport_guide": {{"modes": ["..."], "notes": "..."}},
+        "daily_transport_costs": {{"day_1": 500, "day_2": 800, ...}},
         "recommended_apps": ["..."]
     }},
-    "travel_options": <from provided data>,
+    "travel_options": [
+        {{
+            "mode": "string (flight/train/bus)",
+            "details": "string",
+            "estimated_cost": <number>,
+            "booking_link": "string",
+            "legs": [
+                {{
+                    "mode": "string",
+                    "from_location": "string",
+                    "to_location": "string",
+                    "estimated_cost": <number>,
+                    "duration_hours": <number>,
+                    "booking_link": "string",
+                    "notes": "string"
+                }}
+            ]
+        }}
+    ],
+    "local_information": {{
+        "currency_info": {{"currency": "{request.budget_currency}", "exchange_rate": "...", "payment_methods": ["..."]}},
+        "language_info": {{"primary_language": "...", "common_phrases_needed": true/false}},
+        "cultural_etiquette": ["...", "...", "..."],
+        "safety_tips": ["...", "...", "..."],
+        "emergency_contacts": {{"police": "...", "ambulance": "...", "tourist_helpline": "..."}},
+        "local_customs": ["...", "...", "..."],
+        "tipping_guidelines": {{"restaurants": "...", "taxis": "...", "guides": "..."}},
+        "useful_phrases": {{"hello": "...", "thank_you": "...", "help": "..."}}
+    }},
+    "map_data": {{
+        "interactive_map_embed_url": "https://www.google.com/maps?q=<latitude>,<longitude>"
+    }},
+    "customization_suggestions": ["Budget-friendly alternative: ...", "Luxury upgrade: ...", "Optional day trip: ...", "Alternative activity: ..."],
     "packing_suggestions": ["..."],
     "seasonal_considerations": ["..."]
 }}
+
+IMPORTANT INSTRUCTIONS:
+- For travel_options, provide 2-3 alternatives with different budget levels (Budget, Value, Comfort)
+- Each travel_option MUST have properly structured legs array with all fields including from_location (use origin city: {request.origin}) and to_location (use destination: {request.destination})
+- Use the origin city ({request.origin}) to determine realistic travel routes and modes to reach {request.destination}
+- For local_information, provide practical, destination-specific information for {request.destination}
+- Include emergency numbers specific to {request.destination}
+- For daily_transport_costs, estimate costs for each day (day_1, day_2, etc.) based on the {(request.end_date - request.start_date).days}-day trip
+- customization_suggestions should include at least 3-5 practical alternatives
+- For map_data.interactive_map_embed_url, MUST be a single HTTPS Google Maps URL in format "https://www.google.com/maps?q={{latitude}},{{longitude}}" where latitude and longitude are the numeric coordinates of the main destination city center (e.g., for Munnar use "https://www.google.com/maps?q=10.0889,77.0595"). Do not leave this empty or as a placeholder. Always use actual numeric coordinates.
 
 Accommodations: {json.dumps(places_data.get("accommodations", [])[:8], indent=2)}
 Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent=2)}
@@ -536,8 +580,12 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
                 # Validate required fields
                 if "accommodations" not in overview:
                     raise ValueError("Missing accommodations in overview")
+                if "local_information" not in overview:
+                    raise ValueError("Missing local_information in overview")
+                if "customization_suggestions" not in overview:
+                    raise ValueError("Missing customization_suggestions in overview")
                 
-                self.logger.info("[progressive] Trip overview generated successfully")
+                self.logger.info("[progressive] Trip overview generated successfully with all metadata")
                 return overview
                 
             except json.JSONDecodeError as e:
@@ -598,6 +646,12 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
         trip_duration = (request.end_date - request.start_date).days
         estimated_cost_per_night = float(request.total_budget) * 0.4 / trip_duration  # 40% of budget for accommodation
         
+        # Generate daily transport costs estimate
+        daily_transport_costs = {}
+        avg_daily_transport = float(request.total_budget) * 0.15 / trip_duration  # 15% of budget for transport
+        for day in range(1, trip_duration + 1):
+            daily_transport_costs[f"day_{day}"] = round(avg_daily_transport, 2)
+        
         return {
             "accommodations": {
                 "primary_recommendation": primary_acc,
@@ -615,9 +669,29 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
                     "modes": ["public_transit", "taxi", "walking"],
                     "notes": "Use local transportation for getting around"
                 },
+                "daily_transport_costs": daily_transport_costs,
                 "recommended_apps": ["Google Maps", "Uber", "Local transit app"]
             },
             "travel_options": places_data.get("travel_to_destination", []),
+            "map_data": {
+                "interactive_map_embed_url": f"https://www.google.com/maps/search/?api=1&query={request.destination.replace(' ', '+')}"
+            },
+            "local_information": {
+                "currency_info": {"currency": request.budget_currency, "payment_methods": ["Cash", "Credit Card"]},
+                "language_info": {"primary_language": "Local language", "common_phrases_needed": True},
+                "cultural_etiquette": ["Respect local customs", "Dress modestly at religious sites"],
+                "safety_tips": ["Keep valuables secure", "Stay aware of surroundings", "Use registered taxis"],
+                "emergency_contacts": {"police": "Local police number", "ambulance": "Local ambulance", "tourist_helpline": "Tourist helpline"},
+                "local_customs": ["Learn basic greetings", "Follow local dining etiquette"],
+                "tipping_guidelines": {"restaurants": "Standard tipping practice", "taxis": "Round up fare", "guides": "10-15%"},
+                "useful_phrases": {"hello": "Local greeting", "thank_you": "Local thanks", "help": "Local help phrase"}
+            },
+            "customization_suggestions": [
+                "Consider extending stay for deeper exploration",
+                "Budget-friendly alternative: Use public transport",
+                "Luxury upgrade: Book premium accommodations",
+                "Optional activity: Add day trips to nearby attractions"
+            ],
             "packing_suggestions": [
                 "Comfortable walking shoes",
                 "Weather-appropriate clothing",
@@ -937,12 +1011,12 @@ MANDATORY REQUIREMENTS:
                 "recommended_apps": []
             }),
             
-            "map_data": {
+            "map_data": overview_data.get("map_data", {
                 "interactive_map_embed_url": f"https://www.google.com/maps/search/?api=1&query={request.destination.replace(' ', '+')}",
                 "daily_route_maps": {}
-            },
+            }),
             
-            "local_information": {
+            "local_information": overview_data.get("local_information", {
                 "currency_info": {},
                 "language_info": {},
                 "cultural_etiquette": [],
@@ -951,7 +1025,7 @@ MANDATORY REQUIREMENTS:
                 "local_customs": [],
                 "tipping_guidelines": {},
                 "useful_phrases": {}
-            },
+            }),
             
             "travel_options": overview_data.get("travel_options", []),
             "packing_suggestions": overview_data.get("packing_suggestions", []),
@@ -960,7 +1034,7 @@ MANDATORY REQUIREMENTS:
             "photography_spots": [],
             "hidden_gems": [],
             "alternative_itineraries": {},
-            "customization_suggestions": [],
+            "customization_suggestions": overview_data.get("customization_suggestions", []),
             
             "last_updated": datetime.utcnow().isoformat(),
             "generation_time_seconds": (datetime.utcnow() - start_time).total_seconds(),
