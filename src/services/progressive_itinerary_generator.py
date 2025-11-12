@@ -509,6 +509,11 @@ Budget: {request.total_budget} {request.budget_currency}
 Group: {request.group_size} people
 Style: {request.primary_travel_style}
 
+CRITICAL DATA TYPE RULES:
+- "price_level" in accommodations must be INTEGER (0-4) or null, NEVER strings like "PRICE_LEVEL_EXPENSIVE"
+- ALL costs must be NUMBERS in {request.budget_currency}
+- For international destinations, convert local currency costs to {request.budget_currency}
+
 Return JSON with ALL these fields:
 {{
     "accommodations": {{
@@ -1075,7 +1080,10 @@ CRITICAL RULES:
 5. NEVER repeat the same place across different days - use variety
 6. Every activity must include: activity (full place object), activity_type, estimated_cost_per_person
 7. All monetary values are numbers only (no currency symbols)
-8. Return ONLY valid JSON - no markdown, no explanations"""
+8. "price_level" must be an INTEGER (0-4) or null, NEVER a string like "PRICE_LEVEL_EXPENSIVE"
+   - 0 = Free, 1 = Inexpensive, 2 = Moderate, 3 = Expensive, 4 = Very Expensive
+9. For international destinations, convert all costs to the requested currency (budget_currency)
+10. Return ONLY valid JSON - no markdown, no explanations"""
     
     def _build_user_context(
         self,
@@ -1094,7 +1102,12 @@ Group: {request.group_size} people
 Style: {request.primary_travel_style}
 Activity Level: {request.activity_level}
 Must Try: {', '.join(request.must_try_cuisines or [])}
-Dietary: {', '.join(request.dietary_restrictions or [])}"""
+Dietary: {', '.join(request.dietary_restrictions or [])}
+
+COST INSTRUCTIONS:
+- ALL costs must be in {request.budget_currency}
+- For international destinations, convert local currency to {request.budget_currency}
+- Use realistic exchange rates and current pricing"""
     
     def _create_error_response(
         self,

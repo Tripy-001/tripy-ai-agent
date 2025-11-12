@@ -167,7 +167,28 @@ class ItineraryGeneratorService:
                 place.setdefault("category", default_category)
                 place.setdefault("subcategory", None)
                 place.setdefault("rating", None)
-                place.setdefault("price_level", None)
+                
+                # Convert price_level from string to integer if needed
+                price_level = place.get("price_level")
+                if isinstance(price_level, str):
+                    # LLM sometimes returns "PRICE_LEVEL_INEXPENSIVE" etc instead of integers
+                    price_mapping = {
+                        "PRICE_LEVEL_FREE": 0,
+                        "PRICE_LEVEL_INEXPENSIVE": 1,
+                        "PRICE_LEVEL_MODERATE": 2,
+                        "PRICE_LEVEL_EXPENSIVE": 3,
+                        "PRICE_LEVEL_VERY_EXPENSIVE": 4,
+                    }
+                    place["price_level"] = price_mapping.get(price_level.upper(), None)
+                elif price_level is not None and not isinstance(price_level, int):
+                    # Try to convert to int, or set to None
+                    try:
+                        place["price_level"] = int(price_level)
+                    except (ValueError, TypeError):
+                        place["price_level"] = None
+                else:
+                    place.setdefault("price_level", None)
+                
                 place.setdefault("estimated_cost", None)
                 place.setdefault("duration_hours", None)
                 coords = place.get("coordinates")

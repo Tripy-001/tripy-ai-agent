@@ -187,6 +187,13 @@ class VertexAIService:
                 return """
                 You are an expert AI Trip Planner. Your ONLY task is to return a single valid JSON object that STRICTLY matches the TripPlanResponse schema below. Do NOT include any extra text, markdown, or commentary outside the JSON.
 
+                CRITICAL DATA TYPE RULES:
+                1. "price_level" must be an INTEGER (0-4) or null, NEVER a string like "PRICE_LEVEL_EXPENSIVE"
+                   - 0 = Free, 1 = Inexpensive, 2 = Moderate, 3 = Expensive, 4 = Very Expensive
+                2. All costs must be NUMBERS (not strings with currency symbols)
+                3. For international destinations, convert all costs to the requested currency (typically INR for Indian travelers)
+                4. Coordinates must be actual FLOATS with proper lat/lng values
+
                 JSON OUTPUT SCHEMA (must match exactly; field names and types are strict):
                 {
                     "trip_id": "string",                // Provided by caller; echo back unchanged
@@ -393,6 +400,13 @@ class VertexAIService:
         - Group: {request.group_size} people, ages {request.traveler_ages}
         - Travel Style: {request.primary_travel_style} (secondary: {request.secondary_travel_style})
         - Activity Level: {request.activity_level}
+        
+        COST & CURRENCY INSTRUCTIONS:
+        - ALL costs must be in {request.budget_currency} (e.g., if destination is Vietnam but budget_currency is INR, convert Vietnamese Dong costs to INR)
+        - For international destinations outside India, research typical costs in local currency and convert to {request.budget_currency}
+        - Use realistic exchange rates for the destination country
+        - Ensure all estimated_cost, accommodation costs, meal costs, and activity costs reflect actual converted values
+        - Display all monetary amounts as numbers only (no currency symbols in the JSON)
         
         USER PREFERENCES (1-5 scale):
         {json.dumps(request.preferences.dict(), indent=2)}
