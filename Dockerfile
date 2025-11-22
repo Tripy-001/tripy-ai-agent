@@ -37,12 +37,11 @@ RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
 USER app
 
 # Informational only
-EXPOSE 8080
+EXPOSE 8000
 
 # Start server for Cloud Run with optimized settings for parallel processing:
 # - Use multiple workers for CPU-bound trip generation (set via WORKERS env or default 4)
 # - Use h11 HTTP/1.1 for WebSocket compatibility
 # - Bind to PORT provided by Cloud Run (default 8080 for local)
 # Note: For WebSocket + multi-worker, consider using sticky sessions or external state
-CMD ["sh", "-c", "exec uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers ${WORKERS:-4} --log-level info --timeout-keep-alive 65"]
-
+CMD ["sh", "-c", "exec python -m uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
