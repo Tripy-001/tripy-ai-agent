@@ -434,6 +434,10 @@ Trip Context:
         """
         Validate that a user has access to a specific trip.
         
+        Allows access to:
+        - Trip owner (userId in request or top-level)
+        - Collaborators (users in collaborators array)
+        
         Args:
             trip_id: Trip document ID
             user_id: Firebase user ID
@@ -458,18 +462,31 @@ Trip Context:
             if not trip_user_id:
                 trip_user_id = trip_data.get('userId')
             
+            # Extract collaborators array
+            collaborators = trip_data.get('collaborators', [])
+            if not isinstance(collaborators, list):
+                collaborators = []
+            
             # For development/testing, allow access if no userId is set
             # In production, you should require userId to be set
             if not trip_user_id:
                 self.logger.warning(f"[chat-assistant] Trip {trip_id} has no userId - allowing access for testing")
                 return True, trip_data, None
             
-            # Validate user has access
-            if trip_user_id != user_id:
-                self.logger.warning(f"[chat-assistant] User {user_id} denied access to trip {trip_id} (owner: {trip_user_id})")
-                return False, None, f"You don't have permission to access this trip"
+            # Validate user has access (owner or collaborator)
+            if trip_user_id == user_id:
+                # User is the owner
+                self.logger.info(f"[chat-assistant] User {user_id[:8]}... accessing trip {trip_id} as owner")
+                return True, trip_data, None
             
-            return True, trip_data, None
+            # Check if user is a collaborator
+            if user_id in collaborators:
+                self.logger.info(f"[chat-assistant] User {user_id[:8]}... accessing trip {trip_id} as collaborator")
+                return True, trip_data, None
+            
+            # User is neither owner nor collaborator
+            self.logger.warning(f"[chat-assistant] User {user_id} denied access to trip {trip_id} (owner: {trip_user_id}, collaborators: {len(collaborators)})")
+            return False, None, f"You don't have permission to access this trip"
             
         except Exception as e:
             self.logger.error(f"[chat-assistant] Error validating trip access: {str(e)}", exc_info=True)
