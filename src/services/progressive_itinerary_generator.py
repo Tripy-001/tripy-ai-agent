@@ -11,9 +11,10 @@ Enterprise-grade trip generation that handles long itineraries by:
 
 import logging
 import json
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timedelta
 from decimal import Decimal
+from collections import defaultdict
 
 from src.models.request_models import TripPlanRequest
 from src.models.response_models import TripPlanResponse, DayItineraryResponse
@@ -562,18 +563,73 @@ Return JSON with ALL these fields:
     }},
     "customization_suggestions": ["Budget-friendly alternative: ...", "Luxury upgrade: ...", "Optional day trip: ...", "Alternative activity: ..."],
     "packing_suggestions": ["..."],
-    "seasonal_considerations": ["..."]
+    "seasonal_considerations": ["..."],
+    "photography_spots": [
+        {{
+            "place_id": "string from places_data",
+            "name": "string",
+            "address": "string",
+            "category": "string",
+            "subcategory": null,
+            "rating": number or null,
+            "user_ratings_total": number or null,
+            "price_level": number or null,
+            "estimated_cost": number or null,
+            "duration_hours": number or null,
+            "coordinates": {{"lat": number, "lng": number}},
+            "opening_hours": null,
+            "website": "string or null",
+            "phone": "string or null",
+            "description": "Brief description",
+            "why_recommended": "Why this spot is great for photography (golden hour/sunrise/sunset views, architectural beauty, etc.)",
+            "booking_required": false,
+            "booking_url": null
+        }}
+    ],
+    "hidden_gems": [
+        {{
+            "place_id": "string from places_data",
+            "name": "string",
+            "address": "string",
+            "category": "string",
+            "subcategory": null,
+            "rating": number or null,
+            "user_ratings_total": number or null,
+            "price_level": number or null,
+            "estimated_cost": number or null,
+            "duration_hours": number or null,
+            "coordinates": {{"lat": number, "lng": number}},
+            "opening_hours": null,
+            "website": "string or null",
+            "phone": "string or null",
+            "description": "Brief description",
+            "why_recommended": "Why this is a hidden gem (off the beaten path, local favorite, unique experience, etc.)",
+            "booking_required": false,
+            "booking_url": null
+        }}
+    ]
 }}
 
 IMPORTANT INSTRUCTIONS:
+- Do not include any photo fields (photo_urls, primary_photo, has_photos) in any place data. Photos are added automatically by the photo enrichment service.
 - For travel_options, provide 2-3 alternatives with different budget levels (Budget, Value, Comfort)
 - Each travel_option MUST have properly structured legs array with all fields including from_location (use origin city: {request.origin}) and to_location (use destination: {request.destination})
 - Use the origin city ({request.origin}) to determine realistic travel routes and modes to reach {request.destination}
 - For local_information, provide practical, destination-specific information for {request.destination}
 - Include emergency numbers specific to {request.destination}
-- For daily_transport_costs, estimate costs for each day (day_1, day_2, etc.) based on the {(request.end_date - request.start_date).days}-day trip
+- For daily_transport_costs, use format "Day 1", "Day 2", "Day 3", etc. (NOT day_1, day_2) in sequential order from 1 to {(request.end_date - request.start_date).days}
+- For currency_info within local_information, MUST provide complete details in this EXACT format:
+  {{
+    "currency": "Full Currency Name (CODE)",
+    "symbol": "₹ or $ or € symbol",
+    "exchange_rate": "Conversion rate description",
+    "payment_methods": ["Cash", "Credit Card", "Debit Card", "Mobile Payments"]
+  }}
+  Example for Kerala: {{"currency": "Indian Rupee (INR)", "symbol": "₹", "exchange_rate": "1 INR = 1 INR", "payment_methods": ["Cash", "UPI", "Credit Card", "Debit Card"]}}
 - customization_suggestions should include at least 3-5 practical alternatives
 - For map_data.interactive_map_embed_url, MUST be a single HTTPS Google Maps URL in format "https://www.google.com/maps?q={{latitude}},{{longitude}}" where latitude and longitude are the numeric coordinates of the main destination city center (e.g., for Munnar use "https://www.google.com/maps?q=10.0889,77.0595"). Do not leave this empty or as a placeholder. Always use actual numeric coordinates.
+- photography_spots: Select 3-5 scenic locations from places_data (viewpoints, sunset spots, architectural marvels, cultural sites, beaches, gardens). MUST use complete PlaceResponse format with ALL fields (place_id, name, address, category, rating, coordinates, etc.) EXCEPT photo fields. Do not include photo_urls, primary_photo, or has_photos - these are added automatically. Prioritize places with high ratings and visual appeal.
+- hidden_gems: Select 3-5 lesser-known places from places_data that are off the beaten path but worth visiting (local favorites, quiet temples, small cafes, unique shops). MUST use complete PlaceResponse format with ALL fields (place_id, name, address, category, rating, coordinates, etc.) EXCEPT photo fields. Do not include photo_urls, primary_photo, or has_photos - these are added automatically. Look for places with good ratings but lower user_ratings_total (indicating they're not mainstream tourist spots).
 
 Accommodations: {json.dumps(places_data.get("accommodations", [])[:8], indent=2)}
 Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent=2)}
@@ -651,11 +707,11 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
         trip_duration = (request.end_date - request.start_date).days
         estimated_cost_per_night = float(request.total_budget) * 0.4 / trip_duration  # 40% of budget for accommodation
         
-        # Generate daily transport costs estimate
+        # Generate daily transport costs estimate in proper format (Day 1, Day 2, etc.)
         daily_transport_costs = {}
         avg_daily_transport = float(request.total_budget) * 0.15 / trip_duration  # 15% of budget for transport
         for day in range(1, trip_duration + 1):
-            daily_transport_costs[f"day_{day}"] = round(avg_daily_transport, 2)
+            daily_transport_costs[f"Day {day}"] = round(avg_daily_transport, 2)
         
         return {
             "accommodations": {
@@ -682,7 +738,12 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
                 "interactive_map_embed_url": f"https://www.google.com/maps/search/?api=1&query={request.destination.replace(' ', '+')}"
             },
             "local_information": {
-                "currency_info": {"currency": request.budget_currency, "payment_methods": ["Cash", "Credit Card"]},
+                "currency_info": {
+                    "currency": f"Local Currency ({request.budget_currency})",
+                    "symbol": "₹" if request.budget_currency == "INR" else "$",
+                    "exchange_rate": f"1 {request.budget_currency} = 1 {request.budget_currency}",
+                    "payment_methods": ["Cash", "Credit Card", "Debit Card", "Mobile Payments"]
+                },
                 "language_info": {"primary_language": "Local language", "common_phrases_needed": True},
                 "cultural_etiquette": ["Respect local customs", "Dress modestly at religious sites"],
                 "safety_tips": ["Keep valuables secure", "Stay aware of surroundings", "Use registered taxis"],
@@ -767,7 +828,11 @@ Travel Options: {json.dumps(places_data.get("travel_to_destination", []), indent
                 # Build specialized prompt for chunk following vertex AI schema
                 used_places_note = f"\nALREADY USED PLACES (DO NOT REUSE): {list(used_place_ids)}" if used_place_ids else ""
                 
-                chunk_prompt = f"""{user_context}
+                # Generate city routing guide for multi-city destinations
+                total_days = (request.end_date - request.start_date).days
+                city_routing_guide = self._generate_city_routing_guide(filtered_places, total_days, request.origin)
+                
+                chunk_prompt = f"""{user_context}{city_routing_guide}
 
 Generate daily itineraries for Days {start_day} to {end_day} ({chunk_size} days total).
 
@@ -841,11 +906,18 @@ Return a JSON array of {chunk_size} daily itinerary objects. Each day MUST follo
   }}
 ]
 
+🍽️ CRITICAL MEAL REQUIREMENTS (STRICTLY ENFORCED):
+- EVERY DAY MUST HAVE EXACTLY 3 MEALS: breakfast (morning), lunch (afternoon), dinner (evening)
+- ALL meals MUST use restaurants/cafes from AVAILABLE PLACES DATA with activity_type: "meal"
+- NEVER skip meals - they are MANDATORY for each day
+- Use DIFFERENT restaurants for each meal - no repeats within same day
+- Meals should be the FIRST activity in each time block
+
 MANDATORY REQUIREMENTS:
 1. Use ONLY real place_id values from AVAILABLE PLACES DATA
 2. DO NOT reuse any place_ids from ALREADY USED PLACES list
-3. Include meals: breakfast in morning, lunch in afternoon, dinner in evening (activity_type: "meal")
-4. Each time block should have 1-2 activities maximum
+3. MUST include 3 meals per day: breakfast (morning), lunch (afternoon), dinner (evening) - NO EXCEPTIONS
+4. Each time block: START with meal activity, then add 1-2 sightseeing/activity
 5. Ensure variety - different restaurants for each meal, different attractions each day
 6. All costs are numbers only (no currency symbols)
 7. Coordinates must be valid {{lat, lng}} objects
@@ -1036,8 +1108,8 @@ MANDATORY REQUIREMENTS:
             "packing_suggestions": overview_data.get("packing_suggestions", []),
             "weather_forecast_summary": None,
             "seasonal_considerations": overview_data.get("seasonal_considerations", []),
-            "photography_spots": [],
-            "hidden_gems": [],
+            "photography_spots": overview_data.get("photography_spots", []),
+            "hidden_gems": overview_data.get("hidden_gems", []),
             "alternative_itineraries": {},
             "customization_suggestions": overview_data.get("customization_suggestions", []),
             
@@ -1083,7 +1155,87 @@ CRITICAL RULES:
 8. "price_level" must be an INTEGER (0-4) or null, NEVER a string like "PRICE_LEVEL_EXPENSIVE"
    - 0 = Free, 1 = Inexpensive, 2 = Moderate, 3 = Expensive, 4 = Very Expensive
 9. For international destinations, convert all costs to the requested currency (budget_currency)
-10. Return ONLY valid JSON - no markdown, no explanations"""
+10. Return ONLY valid JSON - no markdown, no explanations
+
+🌍 CRITICAL MULTI-CITY COHERENCE RULES:
+- ALL activities within a single day MUST be from the SAME city
+- NEVER mix cities on the same day (e.g., Jaipur morning + Udaipur afternoon is WRONG)
+- Group consecutive days in the same city before moving to next city
+- Inter-city travel should happen at START of new city block only
+- Follow any provided city routing guide for day allocation
+- Maintain logical geographic flow (don't ping-pong between cities)"""
+    
+    def _extract_city_from_address(self, address: str) -> str:
+        """Extract city name from address string"""
+        if not address:
+            return "Unknown"
+        parts = [p.strip() for p in address.split(',')]
+        if len(parts) >= 2:
+            return parts[-2]
+        return parts[0] if parts else "Unknown"
+    
+    def _cluster_places_by_city(self, places_data: Dict[str, Any]) -> Dict[str, Dict[str, List]]:
+        """Group all places by city for routing purposes"""
+        # Use nested defaultdict to handle any category dynamically
+        city_clusters = defaultdict(lambda: defaultdict(list))
+        
+        for category, places in places_data.items():
+            if not isinstance(places, list):
+                continue
+            for place in places:
+                if not isinstance(place, dict):
+                    continue
+                address = place.get('address', '')
+                city = self._extract_city_from_address(address)
+                city_clusters[city][category].append(place)
+        
+        # Convert to regular dict for JSON serialization
+        return {city: dict(categories) for city, categories in city_clusters.items()}
+    
+    def _generate_city_routing_guide(self, places_data: Dict[str, Any], trip_duration: int, origin: str = None) -> str:
+        """Generate city-by-city routing guide for multi-city destinations"""
+        city_clusters = self._cluster_places_by_city(places_data)
+        
+        if len(city_clusters) <= 1:
+            return ""
+        
+        routing_lines = ["\n🌍 MULTI-CITY TRIP ROUTING:"]
+        city_place_counts = {
+            city: sum(len(places) for places in data.values())
+            for city, data in city_clusters.items()
+        }
+        
+        sorted_cities = sorted(city_place_counts.items(), key=lambda x: x[1], reverse=True)
+        days_allocated = 0
+        city_allocations = []
+        
+        for city, place_count in sorted_cities[:-1]:
+            days_needed = max(2, min(trip_duration - days_allocated - len(sorted_cities) + len(city_allocations) + 1, 
+                                    int(trip_duration * (place_count / sum(city_place_counts.values()))) + 1))
+            city_allocations.append((city, days_allocated + 1, days_allocated + days_needed))
+            days_allocated += days_needed
+        
+        if sorted_cities:
+            last_city = sorted_cities[-1][0]
+            city_allocations.append((last_city, days_allocated + 1, trip_duration))
+        
+        for city, start_day, end_day in city_allocations:
+            routing_lines.append(f"  📍 Days {start_day}-{end_day}: {city}")
+        
+        routing_lines.extend([
+            "",
+            "⚠️ CRITICAL ROUTING RULES:",
+            "  1. ALL activities on a given day MUST be from the SAME city",
+            "  2. NEVER mix cities within the same day",
+            "  3. Group consecutive days in the same city before moving",
+            "  4. Travel between cities should happen at START of new city block",
+            "  5. Follow the suggested city allocation above",
+            "  6. Minimize inter-city travel frequency",
+            f"  7. FINAL DAY (Day {trip_duration}): Include departure/return travel to origin ({origin if origin else 'origin city'}) in evening",
+            ""
+        ])
+        
+        return "\n".join(routing_lines)
     
     def _build_user_context(
         self,
@@ -1094,7 +1246,7 @@ CRITICAL RULES:
         """Build minimal user context for generation"""
         trip_duration = end_day - start_day + 1
         
-        return f"""Destination: {request.destination}
+        base_context = f"""Destination: {request.destination}
 Days: {start_day}-{end_day} (of {(request.end_date - request.start_date).days} total)
 Dates: {request.start_date + timedelta(days=start_day-1)} to {request.start_date + timedelta(days=end_day-1)}
 Budget: {request.total_budget} {request.budget_currency}
@@ -1108,6 +1260,8 @@ COST INSTRUCTIONS:
 - ALL costs must be in {request.budget_currency}
 - For international destinations, convert local currency to {request.budget_currency}
 - Use realistic exchange rates and current pricing"""
+        
+        return base_context
     
     def _create_error_response(
         self,

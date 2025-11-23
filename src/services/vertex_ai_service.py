@@ -4,8 +4,9 @@ import json
 import logging
 import base64
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Set
 from datetime import datetime
+from collections import defaultdict
 from src.models.request_models import TripPlanRequest
 from src.models.response_models import TripPlanResponse
 
@@ -284,7 +285,7 @@ class VertexAIService:
                     "transportation": {
                                     "airport_transfers": { "arrival": { "mode": "string|null", "estimated_cost": "number|null", "notes": "string|null" }, "departure": { "mode": "string|null", "estimated_cost": "number|null", "notes": "string|null" } },
                                     "local_transport_guide": { "modes": ["string"], "notes": "string" },
-                        "daily_transport_costs": { "string": "number" },
+                        "daily_transport_costs": { "Day 1": "number", "Day 2": "number", "Day 3": "number", "..." },
                         "recommended_apps": ["string"]
                     },
 
@@ -294,7 +295,7 @@ class VertexAIService:
                     },
 
                     "local_information": {
-                        "currency_info": "object",
+                        "currency_info": { "currency": "Full Currency Name (CODE)", "symbol": "₹ or $ or €", "exchange_rate": "conversion info", "payment_methods": ["string"] },
                         "language_info": "object",
                         "cultural_etiquette": ["string"],
                         "safety_tips": ["string"],
@@ -345,20 +346,25 @@ class VertexAIService:
                                                                     - Include only real places such as tourist attractions, viewpoints, museums, cultural centers, gardens/parks, markets/shops, restaurants, or cafes.
                                                                     - Do NOT include transport or accommodation as activities. Travel and hotel check-in/out should be reflected in descriptions/notes, not as separate activities.
                                                                     - Keep each time block short (generally 1–2 activities max). Use the activity description to add connective logic like “depart from hotel…”, “arrive from origin…”, or “return to hotel…”.
-                                                                - Enforce a rhythmic daily flow blending sightseeing and culinary variety:
-                                                                    - Morning: include a distinct breakfast as a meal activity (restaurant/cafe) followed by 1 sightseeing/activity.
-                                                                    - Afternoon: lunch at a different venue near the morning/afternoon sights, then 1 sightseeing/activity.
-                                                                    - Evening: a wind-down stop (viewpoint/market/park/cafe) followed by dinner at a unique venue.
-                                                                    - All breakfast, lunch, and dinner recommendations MUST be chosen from the `restaurants` list in the provided `places_data`.
-                                                                    - Never repeat the same restaurant in a trip day; avoid repeating the same cuisine within the same day when options exist.
-                                                                    - Prefer higher-quality dining: when data exists, select restaurants/cafes with rating >= 4.2 and user_ratings_total >= 300; otherwise choose the best available in places_data.
-                                                                    - Use must_try_cuisines and dietary_restrictions to diversify meal choices across days; mention signature dishes in why_recommended when relevant.
+                                                                - 🍽️ CRITICAL MEAL REQUIREMENTS (STRICTLY ENFORCED - NO EXCEPTIONS):
+                                                                    - EVERY DAY MUST HAVE EXACTLY 3 MEALS: breakfast (morning), lunch (afternoon), dinner (evening)
+                                                                    - ALL meals MUST be separate activities with activity_type="meal" using restaurants/cafes from places_data
+                                                                    - NEVER skip meals - they are MANDATORY for EVERY single day - this is non-negotiable
+                                                                    - Meals should be the FIRST activity in each time block (start with food, then activities)
+                                                                    - Morning: START with breakfast (restaurant/cafe from places_data), THEN add 1-2 sightseeing activities
+                                                                    - Afternoon: START with lunch at different venue from places_data, THEN add 1-2 sightseeing activities
+                                                                    - Evening: Include 1 evening activity (viewpoint/market/park), THEN END with dinner at unique venue from places_data
+                                                                    - All breakfast, lunch, and dinner MUST be chosen from the `restaurants` list in places_data with real place_ids
+                                                                    - NEVER repeat the same restaurant within a day; diversify restaurants across all days
+                                                                    - Prefer higher-quality dining: select restaurants with rating >= 4.2 and user_ratings_total >= 300 when available
+                                                                    - Use must_try_cuisines and dietary_restrictions to diversify meal choices; mention signature dishes in why_recommended
                                                                 - Represent meals (breakfast, lunch, dinner) as activities within the appropriate blocks, using restaurants or cafes from places_data with real place_ids. Use activity_type="meal" and estimate costs per person in the specified currency. Include rating and user_ratings_total in PlaceResponse when available.
                                                                 - Cost accuracy and currency rules (STRICT):
                                                                     - All cost fields MUST be numbers (no strings), in the specified currency. Do NOT output ranges (e.g., "10-20"), vague terms ("~", "approx", "varies", "TBD"), or currency symbols within the number. Use the separate currency field for currency.
                                                                     - Activity costs: estimated_cost_per_person is per traveler; group_cost should equal estimated_cost_per_person * group_size (rounded sensibly). Use 0 only when something is genuinely free (e.g., walking, free museum day).
                                                                     - Daily and overall budgets: daily_total_cost and budget_breakdown values must be numerically consistent (the totals should align within about 10%).
                                                                     - Transportation costs: provide numeric values wherever a mode is specified (airport_transfers, daily_transport_costs). Estimate based on realistic local pricing for the destination; avoid null unless truly unknown and then provide a brief note in "notes".
+                                                                    - For daily_transport_costs, use format "Day 1", "Day 2", "Day 3", etc. in SEQUENTIAL ORDER from 1 to trip_duration (NOT day_1, day_2 or random order).
                                                                     - Travel options and legs: always provide numeric estimated_cost values that make sense for the distance/mode and the budget tier; avoid placeholders.
                                                                 - If travel_to_destination or accommodation candidate lists are provided in the user content, select the most suitable options and reflect them in transportation, accommodations, and the travel_options array.
                                                                 - Travel options rules (popular/common routes, budget-tiered alternatives):
@@ -407,6 +413,9 @@ class VertexAIService:
         - Use realistic exchange rates for the destination country
         - Ensure all estimated_cost, accommodation costs, meal costs, and activity costs reflect actual converted values
         - Display all monetary amounts as numbers only (no currency symbols in the JSON)
+        - For local_information.currency_info, provide complete details:
+          {{"currency": "Full Currency Name (CODE)", "symbol": "₹ or $ or €", "exchange_rate": "conversion info", "payment_methods": ["Cash", "Credit Card", "Debit Card", "Mobile Payments"]}}
+          Example: {{"currency": "Indian Rupee (INR)", "symbol": "₹", "exchange_rate": "1 INR = 1 INR", "payment_methods": ["Cash", "UPI", "Credit Card"]}}
         
         USER PREFERENCES (1-5 scale):
         {json.dumps(request.preferences.dict(), indent=2)}
@@ -426,7 +435,19 @@ class VertexAIService:
         AVAILABLE PLACES DATA (COMPACT):
         {json.dumps(compact_places, indent=2)}
         
+        {self._generate_city_routing_guide(places_data, trip_duration, request.origin)}
+        
         Generate a complete trip plan following the TripPlanResponse schema exactly.
+        
+        CRITICAL MULTI-CITY COHERENCE RULES:
+        - If this is a multi-city destination (state/country), ALL activities within a single day MUST be from the SAME city
+        - NEVER mix cities on the same day (e.g., DON'T have Jaipur activity in morning and Udaipur activity in afternoon)
+        - Group consecutive days in the same city (e.g., Days 1-3 in City A, Days 4-6 in City B)
+        - Inter-city travel should happen at the START of a new city block (morning of the first day in new city)
+        - Check the address field of each place to ensure city consistency within each day
+        - Follow the suggested city routing above for optimal flow
+        
+        DAILY PLANNING RULES:
         - Keep daily activities concise and place-only (1–2 real places per time block). No transport or accommodation as activities.
         - Use the origin and travel_options (or travel_to_destination fallback) to determine arrival timing and departure flow.
         - Ensure all costs are realistic for {request.destination} and match the {request.primary_travel_style} travel style.
@@ -437,6 +458,132 @@ class VertexAIService:
         - Critical Final Instruction: Ensure every place, attraction, and restaurant in the final itinerary is selected directly from the AVAILABLE PLACES DATA and uses its corresponding real place_id. Do not invent any places.
         """
 
+    def _extract_city_from_address(self, address: str) -> str:
+        """Extract city name from address string"""
+        if not address or not isinstance(address, str):
+            return "Unknown"
+        
+        # Common patterns: "City, State" or "Place, City, State" or "City - State"
+        # Take the second-to-last or last meaningful segment
+        parts = [p.strip() for p in address.replace(' - ', ', ').split(',')]
+        parts = [p for p in parts if p and len(p) > 1]  # Remove empty/single char
+        
+        # If we have multiple parts, the city is usually second-to-last or third-to-last
+        if len(parts) >= 3:
+            # Skip postal codes and country names
+            for part in reversed(parts[:-1]):  # Exclude last (usually state/country)
+                if not part.isdigit() and len(part) > 2:
+                    return part
+        elif len(parts) >= 2:
+            return parts[-2]  # Second to last
+        elif len(parts) == 1:
+            return parts[0]
+        
+        return "Unknown"
+    
+    def _cluster_places_by_city(self, places_data: Dict[str, Any]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        """Group places by city for multi-city trip planning
+        
+        Returns: {
+            "City1": {"restaurants": [...], "attractions": [...], ...},
+            "City2": {"restaurants": [...], "attractions": [...], ...},
+            ...
+        }
+        """
+        city_clusters: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+        
+        for category, places in places_data.items():
+            if not isinstance(places, list) or category == "travel_to_destination":
+                continue
+            
+            for place in places:
+                if not isinstance(place, dict):
+                    continue
+                
+                # Extract city from address
+                address = place.get("address") or place.get("formattedAddress") or ""
+                city = self._extract_city_from_address(address)
+                
+                # Add to city cluster
+                city_clusters[city][category].append(place)
+        
+        return dict(city_clusters)
+    
+    def _generate_city_routing_guide(self, places_data: Dict[str, Any], trip_duration: int, origin: str = None) -> str:
+        """Generate a suggested city-to-city routing for multi-city trips"""
+        city_clusters = self._cluster_places_by_city(places_data)
+        
+        if len(city_clusters) <= 1:
+            # Single city trip - no routing needed
+            cities = list(city_clusters.keys())
+            single_city_guide = f"Single city trip: {cities[0] if cities else 'destination'}. Spend all {trip_duration} days exploring this city."
+            if origin and trip_duration > 1:
+                single_city_guide += f"\nFINAL DAY (Day {trip_duration}): Include departure/return travel to {origin} in evening activities."
+            return single_city_guide
+        
+        # Multi-city trip - suggest allocation
+        cities = list(city_clusters.keys())
+        if "Unknown" in cities:
+            cities.remove("Unknown")  # Deprioritize unknown
+        
+        # Calculate days per city based on place count
+        city_scores = {}
+        for city, categories in city_clusters.items():
+            if city == "Unknown":
+                continue
+            # Score based on number of places
+            total_places = sum(len(places) for places in categories.values())
+            city_scores[city] = total_places
+        
+        if not city_scores:
+            return f"Destination: Spend all {trip_duration} days in the main area."
+        
+        # Sort cities by score (most places first)
+        sorted_cities = sorted(city_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Allocate days proportionally
+        total_score = sum(score for _, score in sorted_cities)
+        city_allocations = []
+        remaining_days = trip_duration
+        
+        for i, (city, score) in enumerate(sorted_cities):
+            if i == len(sorted_cities) - 1:
+                # Last city gets remaining days
+                days = remaining_days
+            else:
+                # Proportional allocation (minimum 2 days per city)
+                days = max(2, int((score / total_score) * trip_duration))
+                days = min(days, remaining_days - (len(sorted_cities) - i - 1) * 2)
+            
+            remaining_days -= days
+            city_allocations.append((city, days))
+            
+            if remaining_days <= 0:
+                break
+        
+        # Generate routing guide
+        routing_lines = ["MULTI-CITY TRIP ROUTING:"]
+        current_day = 1
+        for city, days in city_allocations:
+            end_day = current_day + days - 1
+            if days == 1:
+                routing_lines.append(f"  - Day {current_day}: {city}")
+            else:
+                routing_lines.append(f"  - Days {current_day}-{end_day}: {city}")
+            current_day = end_day + 1
+        
+        routing_lines.append("")
+        routing_lines.append("CRITICAL ROUTING RULES:")
+        routing_lines.append("  1. ALL activities on a given day MUST be from the SAME city")
+        routing_lines.append("  2. Travel between cities should happen at the START of a new city block")
+        routing_lines.append("  3. Do NOT mix cities within the same day (no Jaipur in morning, Udaipur in afternoon)")
+        routing_lines.append("  4. Cluster consecutive days in the same city before moving to the next city")
+        routing_lines.append("  5. Follow the suggested routing above for optimal travel flow")
+        if origin:
+            routing_lines.append(f"  6. FINAL DAY (Day {trip_duration}): Include departure/return travel to {origin} in evening activities")
+        
+        return "\n".join(routing_lines)
+    
     def _compact_places_data(self, places_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a compact version of places_data for prompting:
         - Drop photos and other heavy fields
@@ -807,7 +954,12 @@ class VertexAIService:
                 "daily_route_maps": {}
             },
             "local_information": {
-                "currency_info": {},
+                "currency_info": {
+                    "currency": "Local Currency (TBD)",
+                    "symbol": "₹",
+                    "exchange_rate": "Rate unavailable",
+                    "payment_methods": ["Cash", "Credit Card"]
+                },
                 "language_info": {},
                 "cultural_etiquette": [],
                 "safety_tips": [],
